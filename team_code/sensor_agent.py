@@ -29,6 +29,8 @@ from scipy.optimize import fsolve
 
 from scenario_logger import ScenarioLogger
 import transfuser_utils as t_u
+from vlm_gate import AsyncVLMGate
+from activation_steering.policy import policy_from_env
 
 import pathlib
 import jsonpickle
@@ -99,6 +101,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     print('Direct control prediction?: ', direct)
     self.stop_after_meter = int(os.environ.get('STOP_AFTER_METER', -1))
     print('STOP_AFTER_METER: ', self.stop_after_meter)
+    self.vlm_steering = strtobool(os.environ.get('VLM_STEERING', 'False'))
+    self.vlm_gate = None
+    self.vlm_last_decision = None
+    self.vlm_last_decision_key = None
+    self.vlm_decision_start_frame = None
+    self.activation_policy = policy_from_env(vlm_enabled=self.vlm_steering)
+    print('Steering Policy: ', self.activation_policy.__class__.__name__)
 
     # If set to true, will generate visualizations at SAVE_PATH
     self.config.debug = int(os.environ.get('DEBUG_CHALLENGE', 0)) == 1
@@ -152,6 +161,10 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
         self.nets.append(net)
 
+    if self.vlm_steering:
+      self.vlm_gate = AsyncVLMGate.from_env()
+      self.vlm_gate.start()
+
     self.stuck_detector = 0
     self.force_move = 0
 
@@ -200,11 +213,16 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     # Path to where visualizations and other debug output gets stored
     self.save_path = os.environ.get('SAVE_PATH', None)
+    self.save_fused_features = strtobool(os.environ.get('SAVE_FUSED_FEATURES', 'False'))
+    self.fused_features_save_path = None
+    self.visual_output_path = None
+    self.activation_action_log = None
 
     # Logger that generates logs used for infraction replay in the results_parser.
     if self.save_path is not None and route_index is not None:
-      self.save_path = pathlib.Path(self.save_path) / route_index
+      self.save_path = pathlib.Path(self.save_path) / str(route_index)
       pathlib.Path(self.save_path).mkdir(parents=True, exist_ok=True)
+      self.activation_action_log = self.save_path / 'activation_actions.jsonl'
 
       self.lon_logger = ScenarioLogger(
           save_path=self.save_path,
@@ -216,6 +234,29 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       )
     else:
       self.save_path = None
+
+    visual_output_root = os.environ.get('VISUAL_OUTPUT_PATH', None)
+    if visual_output_root is not None and route_index is not None:
+      self.visual_output_path = pathlib.Path(visual_output_root) / str(route_index)
+      self.visual_output_path.mkdir(parents=True, exist_ok=True)
+    elif self.save_path is not None:
+      self.visual_output_path = self.save_path
+
+    fused_features_root = os.environ.get('FUSED_FEATURES_PATH', None)
+    if self.save_fused_features:
+      if fused_features_root is not None:
+        self.fused_features_save_path = pathlib.Path(fused_features_root)
+        if route_index is not None:
+          self.fused_features_save_path = self.fused_features_save_path / str(route_index)
+      elif self.save_path is not None:
+        self.fused_features_save_path = self.save_path / 'fused_features'
+      elif route_index is not None:
+        self.fused_features_save_path = pathlib.Path('fused_features') / str(route_index)
+      else:
+        self.fused_features_save_path = pathlib.Path('fused_features')
+
+      self.fused_features_save_path.mkdir(parents=True, exist_ok=True)
+      print('Save fused features to:', self.fused_features_save_path)
 
     self.metric_info = {}
     self.live_visu = strtobool(os.environ.get('LIVE_VISU', 'False'))
@@ -341,6 +382,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
       rgb_pos = cv2.cvtColor(camera, cv2.COLOR_BGR2RGB)
       rgb_pos = t_u.crop_array(self.config, rgb_pos)
+      rgb_front_np = rgb_pos.copy()
 
       # Switch to pytorch channel first order
       rgb_pos = np.transpose(rgb_pos, (2, 0, 1))
@@ -355,6 +397,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     result = {
         'rgb': rgb,
         'compass': compass,
+        'rgb_front_np': rgb_front_np,
     }
 
     if self.config.backbone not in ('aim'):
@@ -509,30 +552,73 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       dt = self.config.carla_frame_rate
       self.meters_travelled = self.meters_travelled + speed * dt
 
+    steering_alpha = 0.0
+    if self.vlm_gate is not None:
+      self.vlm_last_decision = self.vlm_gate.latest()
+      decision_age_frames = None
+      if self.vlm_last_decision is not None:
+        decision_key = (self.vlm_last_decision.frame_id, self.vlm_last_decision.timestamp)
+        if decision_key != self.vlm_last_decision_key:
+          self.vlm_last_decision_key = decision_key
+          self.vlm_decision_start_frame = self.step
+        decision_age_frames = self.step - self.vlm_decision_start_frame
+      steering_alpha = self.activation_policy.alpha(
+          self.step,
+          self.vlm_last_decision,
+          decision_age_frames=decision_age_frames)
+      if self.vlm_last_decision is not None:
+        if self.vlm_gate.verbose and steering_alpha > 0.0:
+          print(
+              f"[VLMGate] use step={self.step} decision_frame={self.vlm_last_decision.frame_id} "
+              f"age={decision_age_frames} alpha={steering_alpha:.3f} reason={self.vlm_last_decision.reason}",
+              flush=True)
+      elif self.vlm_gate.verbose:
+        print(f"[VLMGate] use step={self.step} no completed decision yet; alpha=0.000", flush=True)
+    else:
+      steering_alpha = self.activation_policy.alpha(self.step)
+
     # forward pass
     pred_wps = []
     pred_target_speeds = []
     pred_checkpoints = []
     bounding_boxes = []
     wp_selected = None
+    feature_frame_idx = self.step
     for i in range(self.model_count):
       if self.config.backbone in ('transFuser', 'aim', 'bev_encoder'):
-        pred_wp, \
-        pred_target_speed, \
-        pred_checkpoint, \
-        pred_semantic, \
-        pred_bev_semantic, \
-        pred_depth, \
-        pred_bb_features,\
-        attention_weights,\
-        pred_wp_1,\
-        selected_path = self.nets[i].forward(
+        model_output = self.nets[i].forward(
           rgb=tick_data['rgb'],
           lidar_bev=lidar_bev,
           target_point=tick_data['target_point'],
           target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
           ego_vel=velocity,
-          command=tick_data['command'])
+          command=tick_data['command'],
+          steering_alpha=steering_alpha,
+          return_fused_features=self.save_fused_features)
+        if self.save_fused_features:
+          pred_wp, \
+          pred_target_speed, \
+          pred_checkpoint, \
+          pred_semantic, \
+          pred_bev_semantic, \
+          pred_depth, \
+          pred_bb_features,\
+          attention_weights,\
+          pred_wp_1,\
+          selected_path, \
+          fused_features = model_output
+          self._save_fused_features(fused_features, i, feature_frame_idx)
+        else:
+          pred_wp, \
+          pred_target_speed, \
+          pred_checkpoint, \
+          pred_semantic, \
+          pred_bev_semantic, \
+          pred_depth, \
+          pred_bb_features,\
+          attention_weights,\
+          pred_wp_1,\
+          selected_path = model_output
         # Only convert bounding boxes when they are used.
         if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
                                          self.stop_sign_controller):
@@ -568,6 +654,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     else:
       bbs_vehicle_coordinate_system = None
 
+    stop_for_stop_sign = False
     if self.stop_sign_controller:
       stop_for_stop_sign = self.stop_sign_controller_step(gt_velocity.item())
 
@@ -576,6 +663,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if self.config.use_wp_gru:
       self.pred_wp = torch.stack(pred_wps, dim=0).mean(dim=0)
+
+    if self.vlm_gate is not None and speed > 3.5:
+      self.vlm_gate.submit(
+          frame_id=self.step,
+          rgb_image=tick_data['rgb_front_np'],
+          speed=speed,
+          command=self.commands[-2],
+          target_point=tick_data['target_point'])
 
     # calculate target speed scalar from model predictions
     if self.config.use_controller_input_prediction:
@@ -600,7 +695,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         prob_target_speed = pred_target_speed
 
       debug_image = self.nets[0].visualize_model(
-          self.save_path if self.save_path is not None else '.',
+          self.visual_output_path if self.visual_output_path is not None else '.',
           self.step,
           tick_data['rgb'],
           lidar_bev,
@@ -618,7 +713,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           gt_wp=pred_wp_1,
           wp_selected=wp_selected,
           return_image=self.live_visu,
-          save_to_disk=(self.save_path is not None))
+          save_to_disk=(self.visual_output_path is not None))
 
       if self.live_visu and debug_image is not None:
         self._display_debug_output(debug_image)
@@ -684,6 +779,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       brake = True
 
     control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
+    self._log_activation_action(
+        frame_idx=feature_frame_idx,
+        control=control,
+        speed=float(gt_velocity.item() if hasattr(gt_velocity, 'item') else gt_velocity),
+        pred_target_speed=float(pred_target_speed_scalar),
+        stop_for_stop_sign=bool(stop_for_stop_sign),
+        activation_alpha=steering_alpha)
 
     if self.IS_BENCH2DRIVE:
       # TODO doesn't seem to work
@@ -701,6 +803,214 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       self.control = control
 
     return control
+
+  def _draw_vlm_trajectory_overlay(self, rgb_image, trajectory):
+    image = np.ascontiguousarray(rgb_image.copy())
+    corridor_segments = self._build_vlm_trajectory_corridor_segments(trajectory)
+    if not corridor_segments:
+      return image
+
+    opacity = 0.25
+    overlay = image.copy()
+
+    for t_s, polygon_ego in corridor_segments:
+      projected = self._project_ego_points_to_front_image(polygon_ego)
+      if projected is None:
+        continue
+      polygon_xy, _ = projected
+      if len(polygon_xy) != 4:
+        continue
+      polygon_xy = polygon_xy.astype(np.int32).reshape(-1, 1, 2)
+      color = self._vlm_trajectory_color(t_s)
+      cv2.fillPoly(overlay, [polygon_xy], color, lineType=cv2.LINE_AA)
+      cv2.polylines(overlay, [polygon_xy], True, color, 1, lineType=cv2.LINE_AA)
+    return cv2.addWeighted(overlay, opacity, image, 1.0 - opacity, 0.0)
+
+  def _build_vlm_trajectory_corridor_segments(self, trajectory):
+    if trajectory is None:
+      return []
+
+    centers = np.asarray(trajectory, dtype=np.float32)
+    if centers.ndim == 3:
+      centers = centers[0]
+    if centers.ndim != 2 or centers.shape[1] < 2 or len(centers) < 2:
+      return []
+
+    centers = centers[:, :2]
+    half_width = float(self.config.ego_extent_y)
+    horizon_s = 4.0
+    num_points = len(centers)
+    segments = []
+
+    for idx in range(num_points - 1):
+      p0 = centers[idx]
+      p1 = centers[idx + 1]
+      tangent = p1 - p0
+      norm = float(np.linalg.norm(tangent))
+      if norm < 1e-4:
+        continue
+      tangent = tangent / norm
+      right_normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32)
+      polygon = np.asarray([
+          p0 - right_normal * half_width,
+          p1 - right_normal * half_width,
+          p1 + right_normal * half_width,
+          p0 + right_normal * half_width,
+      ], dtype=np.float32)
+      t_s = (float(idx) + 1.5) / float(num_points) * horizon_s
+      segments.append((t_s, polygon))
+
+    return segments
+
+  @staticmethod
+  def _vlm_trajectory_color(t_s):
+    if t_s <= 1.5:
+      return (180, 0, 0)
+    if t_s <= 3.0:
+      return (255, 128, 0)
+    return (255, 230, 0)
+
+  def _resample_vlm_trajectory_by_time(self, trajectory, speed):
+    if trajectory is None:
+      return None
+
+    points = np.asarray(trajectory, dtype=np.float32)
+    if points.ndim == 3:
+      points = points[0]
+    if points.ndim != 2 or points.shape[1] < 2 or len(points) == 0:
+      return None
+
+    points = points[:, :2]
+    num_points = 16
+    horizon_s = 4.0
+    speed = max(float(speed), 0.0)
+    target_distances = np.linspace(horizon_s / num_points, horizon_s, num_points, dtype=np.float32) * speed
+
+    path = np.vstack((np.zeros((1, 2), dtype=np.float32), points))
+    segment_vectors = path[1:] - path[:-1]
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+
+    if cumulative[-1] <= 1e-4:
+      return np.zeros((num_points, 2), dtype=np.float32)
+
+    sampled = []
+    for distance in target_distances:
+      if distance <= cumulative[-1]:
+        segment_idx = np.searchsorted(cumulative, distance, side='right') - 1
+        segment_idx = int(np.clip(segment_idx, 0, len(segment_lengths) - 1))
+        denom = max(segment_lengths[segment_idx], 1e-4)
+        ratio = (distance - cumulative[segment_idx]) / denom
+        sampled.append(path[segment_idx] + ratio * segment_vectors[segment_idx])
+      else:
+        direction = segment_vectors[-1] / max(segment_lengths[-1], 1e-4)
+        sampled.append(path[-1] + direction * (distance - cumulative[-1]))
+
+    return np.asarray(sampled, dtype=np.float32)
+
+  def _project_ego_points_to_front_image(self, trajectory):
+    if trajectory is None:
+      return None
+
+    points = np.asarray(trajectory, dtype=np.float32)
+    if points.ndim == 3:
+      points = points[0]
+    if points.ndim != 2 or points.shape[1] < 2:
+      return None
+
+    points = points[:, :2]
+    if len(points) == 0:
+      return None
+
+    z = float(os.environ.get('VLM_TRAJECTORY_Z_M', 0.0))
+    points_3d = np.concatenate((points, np.full((len(points), 1), z, dtype=np.float32)), axis=1)
+
+    camera_pos = np.asarray(self.config.camera_pos, dtype=np.float32)
+    camera_points = points_3d - camera_pos.reshape(1, 3)
+    # Ego/CARLA uses z-up; pinhole image coordinates use y-down.
+    pinhole_points = np.stack((camera_points[:, 1], -camera_points[:, 2], camera_points[:, 0]), axis=0)
+    intrinsic = t_u.calculate_intrinsic_matrix(
+        fov=self.config.camera_fov,
+        height=self.config.camera_height,
+        width=self.config.camera_width)
+    projected = intrinsic @ pinhole_points
+    depth = projected[2]
+    valid = depth > 0.1
+    projected_xy = projected[:2].T
+    projected_xy[valid] = projected_xy[valid] / depth[valid, None]
+
+    if self.config.crop_image:
+      side_crop = (self.config.camera_width - self.config.cropped_width) // 2
+      projected_xy[:, 0] -= side_crop
+      image_width = self.config.cropped_width
+      image_height = self.config.cropped_height
+    else:
+      image_width = self.config.camera_width
+      image_height = self.config.camera_height
+
+    valid = valid & (projected_xy[:, 0] >= 0.0) & (projected_xy[:, 0] < image_width)
+    valid = valid & (projected_xy[:, 1] >= 0.0) & (projected_xy[:, 1] < image_height)
+    projected_xy = projected_xy[valid]
+    if len(projected_xy) == 0:
+      return None
+
+    return projected_xy, np.nonzero(valid)[0]
+
+  def _save_fused_features(self, fused_features, model_idx, frame_idx):
+    if self.fused_features_save_path is None or fused_features is None:
+      return
+
+    save_path = self.fused_features_save_path
+    if self.model_count > 1:
+      save_path = save_path / f'model_{model_idx:02d}'
+      save_path.mkdir(parents=True, exist_ok=True)
+
+    torch.save(fused_features.detach().cpu(), save_path / f'{int(frame_idx):06d}.pt')
+
+  def _log_activation_action(self,
+                             frame_idx,
+                             control,
+                             speed,
+                             pred_target_speed,
+                             stop_for_stop_sign=False,
+                             activation_alpha=None):
+    if self.activation_action_log is None:
+      return
+
+    feature_path = None
+    if self.fused_features_save_path is not None:
+      feature_dir = self.fused_features_save_path
+      if self.model_count > 1:
+        feature_dir = feature_dir / 'model_00'
+      feature_path = str(feature_dir / f'{int(frame_idx):06d}.pt')
+
+    record = {
+        'frame': int(frame_idx),
+        'speed': float(speed),
+        'pred_target_speed': float(pred_target_speed),
+        'steer': float(control.steer),
+        'throttle': float(control.throttle),
+        'brake': float(control.brake),
+        'stop_for_stop_sign': bool(stop_for_stop_sign),
+        'activation_alpha': self._json_activation_alpha(activation_alpha),
+        'feature_path': feature_path,
+    }
+    with open(self.activation_action_log, 'a', encoding='utf-8') as f:
+      f.write(ujson.dumps(record) + '\n')
+
+  @staticmethod
+  def _json_activation_alpha(activation_alpha):
+    if activation_alpha is None:
+      return None
+    if hasattr(activation_alpha, 'detach'):
+      activation_alpha = activation_alpha.detach().cpu().flatten().tolist()
+    elif isinstance(activation_alpha, np.ndarray):
+      activation_alpha = activation_alpha.reshape(-1).tolist()
+    elif isinstance(activation_alpha, (list, tuple)):
+      activation_alpha = list(activation_alpha)
+    else:
+      return float(activation_alpha)
+    return [float(value) for value in activation_alpha]
 
   def _display_debug_output(self, image):
     if not self.live_visu or self._quit_requested:
@@ -835,6 +1145,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if self._visu_interface is not None:
       self._visu_interface.close()
+
+    if self.vlm_gate is not None:
+      self.vlm_gate.stop()
 
     del self.nets
     del self.config

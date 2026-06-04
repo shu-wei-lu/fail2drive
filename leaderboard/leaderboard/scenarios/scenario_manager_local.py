@@ -45,7 +45,7 @@ class ScenarioManager(object):
     4. If needed, cleanup with manager.stop_scenario()
     """
 
-    def __init__(self, timeout, statistics_manager, debug_mode=0):
+    def __init__(self, timeout, statistics_manager, debug_mode=0, max_frames=0):
         """
         Setups up the parameters, which will be filled at load_scenario()
         """
@@ -60,6 +60,10 @@ class ScenarioManager(object):
         self._running = False
         self._timestamp_last_run = 0.0
         self._timeout = float(timeout)
+        self._max_frames = int(max_frames)
+        if self._max_frames < 0:
+            raise ValueError("max_frames must be >= 0")
+        self._frames_run = 0
 
         self.scenario_duration_system = 0.0
         self.scenario_duration_game = 0.0
@@ -111,6 +115,7 @@ class ScenarioManager(object):
         GameTime.restart()
         self._agent_wrapper = AgentWrapperFactory.get_wrapper(agent)
         self.route_index = route_index
+        self._frames_run = 0
         self.scenario = scenario
         self.scenario_tree = scenario.scenario_tree
         self.ego_vehicles = scenario.ego_vehicles
@@ -220,6 +225,11 @@ class ScenarioManager(object):
 
             if self.scenario_tree.status != py_trees.common.Status.RUNNING:
                 self._running = False
+            elif self._max_frames > 0:
+                self._frames_run += 1
+                if self._frames_run >= self._max_frames:
+                    print("Reached max frames per run: {}".format(self._max_frames))
+                    self._running = False
 
             ego_trans = self.ego_vehicles[0].get_transform()
 

@@ -89,7 +89,7 @@ class LeaderboardEvaluator(object):
         self.module_agent = importlib.import_module(module_name)
 
         # Create the ScenarioManager
-        self.manager = ScenarioManager(args.timeout, self.statistics_manager, args.debug)
+        self.manager = ScenarioManager(args.timeout, self.statistics_manager, args.debug, getattr(args, 'max_frames', 0))
 
         # Time control for summary purposes
         self._start_time = GameTime.get_time()
@@ -477,6 +477,8 @@ def main():
                         help='Use CARLA recording feature to create a recording of the scenario')
     parser.add_argument('--timeout', default=300.0, type=float,
                         help='Set the CARLA client timeout value in seconds')
+    parser.add_argument('--max-frames', default=0, type=int,
+                        help='Stop each route/repetition run after this many evaluator frames. 0 means no limit')
 
     # simulation setup
     parser.add_argument('--routes', required=True,
@@ -500,8 +502,18 @@ def main():
                         help="Path to checkpoint used for saving statistics and resuming")
     parser.add_argument("--debug-checkpoint", type=str, default='./live_results.txt',
                         help="Path to checkpoint used for saving live results")
+    parser.add_argument("--save-fused-features", action="store_true",
+                        help="Save model fused features for each evaluation frame")
+    parser.add_argument("--fused-features-path", type=str, default="",
+                        help="Directory used for saved fused features")
 
     arguments = parser.parse_args()
+
+    if arguments.save_fused_features:
+        os.environ["SAVE_FUSED_FEATURES"] = "1"
+    if arguments.fused_features_path:
+        os.environ["FUSED_FEATURES_PATH"] = arguments.fused_features_path
+        os.environ["SAVE_FUSED_FEATURES"] = "1"
 
     pathlib.Path(arguments.checkpoint).parent.mkdir(parents=True, exist_ok=True)
 

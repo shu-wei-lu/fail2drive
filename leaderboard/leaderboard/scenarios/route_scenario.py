@@ -204,6 +204,9 @@ class RouteScenario(BasicScenario):
 
     def spawn_parked_vehicles(self, ego_vehicle, max_scenario_distance=10):
         """Spawn parked vehicles."""
+        if os.environ.get("NO_OTHER_VEHICLES", "0").lower() in ("1", "true", "yes", "y"):
+            return
+
         def is_close(slot_location, ego_location):
             return slot_location.distance(ego_location) < self.PARKED_VEHICLES_INIT_THRESHOLD
         def is_free(slot_location):
@@ -401,7 +404,8 @@ class RouteScenario(BasicScenario):
         self.scenario_triggerer = scenario_triggerer
 
         # Add the Background Activity
-        behavior.add_child(BackgroundBehavior(self.ego_vehicles[0], self.route, name="BackgroundActivity"))
+        if os.environ.get("NO_OTHER_VEHICLES", "0").lower() not in ("1", "true", "yes", "y"):
+            behavior.add_child(BackgroundBehavior(self.ego_vehicles[0], self.route, name="BackgroundActivity"))
 
         behavior.add_children(scenario_behaviors)
         return behavior

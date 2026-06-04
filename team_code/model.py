@@ -19,7 +19,7 @@ from copy import deepcopy
 import math
 import os
 from nav_planner import LateralPIDController, get_throttle
-
+from activation_steering.injector import ActivationInjector
 
 class LidarCenterNet(nn.Module):
   """
@@ -33,6 +33,8 @@ class LidarCenterNet(nn.Module):
 
     self.speed_histogram = []
     self.make_histogram = int(os.environ.get('HISTOGRAM', 0))
+    vector_path = Path(__file__).resolve().parent.parent / 'steering_feats' / 'brake_minus_normal.pt'
+    self.activation_injector = ActivationInjector.from_env(vector_path)
 
     if self.config.backbone == 'transFuser':
       self.backbone = TransfuserBackbone(config)
@@ -281,11 +283,11 @@ class LidarCenterNet(nn.Module):
     if self.config.tp_attention:
       nn.init.uniform_(self.tp_pos_embed)
 
-  def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None):
+  def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None, steering_alpha=None,
+              return_fused_features=False):
     bs = rgb.shape[0]
     if self.config.two_tp_input:
       target_point = torch.cat((target_point, target_point_next), axis=1)
-
     if self.config.backbone == 'transFuser':
       bev_feature_grid, fused_features, image_feature_grid = self.backbone(rgb, lidar_bev)
     elif self.config.backbone == 'aim':
@@ -302,6 +304,9 @@ class LidarCenterNet(nn.Module):
     attention_weights = None
     pred_wp_1 = None
     selected_path = None
+    pred_bounding_box = None
+    if self.config.detect_boxes:
+      pred_bounding_box = self.head(bev_feature_grid)
 
     if self.config.use_wp_gru or self.config.use_controller_input_prediction:
       if self.config.transformer_decoder_join:
@@ -329,6 +334,7 @@ class LidarCenterNet(nn.Module):
 
       if self.config.transformer_decoder_join:
         fused_features = torch.permute(fused_features, (0, 2, 1))
+        # fused_features_to_save = fused_features
         if self.config.use_wp_gru:
           if self.config.multi_wp_output:
             joined_wp_features = self.join(self.wp_query.repeat(bs, 1, 1), fused_features)
@@ -361,6 +367,10 @@ class LidarCenterNet(nn.Module):
           else:
             joined_checkpoint_features = self.join(self.checkpoint_query.repeat(bs, 1, 1), fused_features)
 
+          features_to_save = joined_checkpoint_features
+          joined_checkpoint_features = self.activation_injector.apply(
+                joined_checkpoint_features,
+                alpha=steering_alpha)
           gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
           target_speed_features = joined_checkpoint_features[:, self.config.predict_checkpoint_len]
 
@@ -373,6 +383,7 @@ class LidarCenterNet(nn.Module):
             pred_target_speed = self.target_speed_network(target_speed_features)
 
       else:
+        # fused_features_to_save = fused_features
         joined_features = self.join(fused_features)
         gru_features = joined_features
         target_speed_features = joined_features[:, :self.config.gru_hidden_size]
@@ -404,12 +415,12 @@ class LidarCenterNet(nn.Module):
       # Mask invisible pixels. They will be ignored in the loss
       pred_bev_semantic = pred_bev_semantic * self.valid_bev_pixels
 
-    pred_bounding_box = None
-    if self.config.detect_boxes:
-      pred_bounding_box = self.head(bev_feature_grid)
-
-    return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
-      pred_bounding_box, attention_weights, pred_wp_1, selected_path
+    output = (pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth,
+              pred_bounding_box, attention_weights, pred_wp_1, selected_path)
+    if return_fused_features:
+      return output + (features_to_save, )
+    
+    return output
 
   def compute_loss(self, pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth,
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,

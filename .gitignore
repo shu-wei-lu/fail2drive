@@ -18,6 +18,13 @@
 /EvaluateExpert/
 logs/
 test/
+viz_vehicle/
+VAD/
+UniAD/
+steering/
+gifs/
+checkpoints/
+f2d_carla/
 *.sif
 
 data/1_scenario_per_route_rm_unmanageable_v5/

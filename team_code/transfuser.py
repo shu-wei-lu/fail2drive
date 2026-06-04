@@ -12,6 +12,76 @@ import transfuser_utils as t_u
 from video_resnet import VideoResNet
 import copy
 
+import torch
+
+def inject_spatial_features(target_features, patch_features, offset_y, offset_x, alpha=9):
+    """
+    將小的 patch_features 安全地疊加到大的 target_features 的指定相對位置上。
+    
+    Args:
+        target_features: [1, C, H, W] 模型當前的 LiDAR 特徵圖
+        patch_features:  [1, C, h1, w1] 你算出來的 steered_features
+        offset_y: 障礙物在 Ego 「右方」多少格 (正值代表右方，負值代表左方)
+        offset_x: 障礙物在 Ego 「前方」多少格 (正值代表前方，負值代表後方)
+        alpha: 干預強度
+        
+    Returns:
+        注入後的 target_features
+    """
+    # 確保 Channel 數與 Device 一致
+    patch_features = patch_features.to(target_features.device)  
+    assert target_features.shape[1] == patch_features.shape[1], "Channel dimension must match!"
+    
+    H, W = target_features.shape[2], target_features.shape[3]
+    h1, w1 = patch_features.shape[2], patch_features.shape[3]
+    
+    # 1. 定位 Ego 的絕對中心點
+    ego_y = H // 2
+    ego_x = W // 2
+    
+    # 2. 將相對位移轉換為 Tensor 的絕對座標
+    # 往前走 -> X 變大
+    abs_center_x = ego_x + offset_x
+    # 往右走 -> Y 變大 (因為上面是左，所以下面是右)
+    abs_center_y = ego_y + offset_y
+    
+    # ... 後面的裁切與疊加邏輯完全維持不變 ...
+    start_y = abs_center_y - (h1 // 2)
+    end_y = start_y + h1
+    start_x = abs_center_x - (w1 // 2)
+    end_x = start_x + w1
+    
+    # 4. 計算「實際上」合法的 Target 邊界 (防止 IndexError)
+    valid_start_y = max(0, start_y)
+    valid_end_y = min(H, end_y)
+    valid_start_x = max(0, start_x)
+    valid_end_x = min(W, end_x)
+    
+    # 如果整個 Patch 都掉出 Target 範圍外，直接返回原圖
+    if valid_start_y >= valid_end_y or valid_start_x >= valid_end_x:
+        print(f"Warning: Injection offset (forward: {offset_x}, right: {offset_y}) is fully out of bounds.")
+        return target_features
+        
+    # 5. 反向推算 Patch 需要被裁切的範圍
+    patch_start_y = valid_start_y - start_y
+    patch_end_y = h1 - (end_y - valid_end_y)
+    patch_start_x = valid_start_x - start_x
+    patch_end_x = w1 - (end_x - valid_end_x)
+    
+    # 6. 執行疊加
+    target_features[:, :, valid_start_y:valid_end_y, valid_start_x:valid_end_x] = 0
+    target_features[:, :, valid_start_y:valid_end_y, valid_start_x:valid_end_x] += (
+        alpha * patch_features[:, :, patch_start_y:patch_end_y, patch_start_x:patch_end_x]
+    )
+    
+    return target_features
+
+def inject_spatial_features_simple(target_features, patch_features, offset_y, offset_x, alpha=1):
+  patch_features = patch_features.to(target_features.device)  
+  target_features[:, :, offset_y, offset_x] = 0
+  target_features[:, :, offset_y, offset_x] += (alpha * patch_features) # 1-d features
+  
+  return target_features
 
 class TransfuserBackbone(nn.Module):
   """
@@ -136,7 +206,7 @@ class TransfuserBackbone(nn.Module):
 
     return p3
 
-  def forward(self, image, lidar):
+  def forward(self, image, lidar, steered_features=None, offset_y=0, offset_x=0):
     '''
         Image + LiDAR feature fusion using transformers
         Args:
@@ -147,7 +217,7 @@ class TransfuserBackbone(nn.Module):
       image_features = t_u.normalize_imagenet(image)
     else:
       image_features = image
-
+  
     if self.lidar_video:
       batch_size = lidar.shape[0]
       lidar_features = lidar.view(batch_size, -1, self.config.lidar_seq_len, self.config.lidar_resolution_height,
@@ -170,7 +240,6 @@ class TransfuserBackbone(nn.Module):
     for i in range(4):
       image_features = self.forward_layer_block(image_layers, self.image_encoder.return_layers, image_features)
       lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
-
       image_features, lidar_features = self.fuse_features(image_features, lidar_features, i)
 
     if self.config.detect_boxes or self.config.use_bev_semantic:

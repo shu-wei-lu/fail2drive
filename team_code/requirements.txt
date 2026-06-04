@@ -1,4 +1,6 @@
 carla==0.9.15
+accelerate>=0.26.0
+bitsandbytes>=0.43.0
 dictor==0.1.12
 diskcache==5.4.0
 einops==0.4.1
@@ -41,11 +43,11 @@ torchaudio==2.5.0
 torchmetrics==0.11.0
 torchvision==0.20.0
 tqdm==4.66.1
-transformers==4.21.2
+transformers>=4.49.0
 transforms3d==0.4.1
 ujson==5.9.0
 wandb==0.16.6
 webcolors==1.13
 xmlschema==1.0.18
 pandas
-pyQt6
+PyQt6==6.7.1

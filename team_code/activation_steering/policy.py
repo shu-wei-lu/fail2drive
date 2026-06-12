@@ -353,6 +353,396 @@ class OraclePolicy(ActivationPolicy):
     return math.hypot(dx, dy)
 
 
+class PDMOraclePolicy(OraclePolicy):
+  """Conservative PDM-like oracle using only online CARLA actor/scenario state.
+
+  This policy does not consume PDM-Lite labels or expert trajectories. It maps
+  scenario-runner active_scenarios plus live actor geometry into the same action
+  vector as OraclePolicy: [brake, left, right].
+
+  The main difference from OraclePolicy is that two-way obstacle scenarios do not
+  trigger lateral steering unless a simple opposite-lane clearance check passes.
+  If the path is not clear, the policy stays inactive unless the obstacle is an
+  imminent brake hazard.
+  """
+
+  ONE_WAY_LATERAL_SCENARIOS = frozenset({
+      "Accident",
+      "ConstructionObstacle",
+      "ParkedObstacle",
+  })
+  TWO_WAY_LATERAL_SCENARIOS = frozenset({
+      "AccidentTwoWays",
+      "ConstructionObstacleTwoWays",
+      "ParkedObstacleTwoWays",
+      "VehicleOpensDoorTwoWays",
+  })
+  PRIORITY_BRAKE_SCENARIOS = frozenset({
+      "OppositeVehicleTakingPriority",
+      "OppositeVehicleRunningRedLight",
+      "NormalVehicleTakingPriority",
+      "NormalVehicleRunningRedLight",
+  })
+
+  def __init__(
+      self,
+      alpha: float,
+      action: str = "auto",
+      trigger_distance: float = 50.0,
+      min_distance: float = 0.0,
+      brake_hazard_distance: float = 20.0,
+      brake_hazard_lateral_margin: float = 2.5,
+      brake_reaction_time: float = 0.4,
+      brake_deceleration: float = 6.0,
+      brake_distance_margin: float = 2.0,
+      brake_ttc_threshold: float = 2.0,
+      brake_min_closing_speed: float = 0.5,
+      hold_frames: int = 8,
+      cooldown_frames: int = 20,
+      allow_multi_action: bool = False,
+      verbose: bool = False,
+      two_way_clear_distance: float = 70.0,
+      lane_key_search_distance: float = 90.0,
+      side_hazard_distance: float = 25.0,
+      side_hazard_two_way_distance: float = 10.0,
+      roadblocked_distance: float = 40.0,
+      priority_distance: float = 50.0,
+      yield_emergency_distance: float = 50.0,
+      general_brake: bool = False,
+  ):
+    super().__init__(
+        alpha=alpha,
+        action=action,
+        trigger_distance=trigger_distance,
+        min_distance=min_distance,
+        brake_hazard_distance=brake_hazard_distance,
+        brake_hazard_lateral_margin=brake_hazard_lateral_margin,
+        brake_reaction_time=brake_reaction_time,
+        brake_deceleration=brake_deceleration,
+        brake_distance_margin=brake_distance_margin,
+        brake_ttc_threshold=brake_ttc_threshold,
+        brake_min_closing_speed=brake_min_closing_speed,
+        hold_frames=hold_frames,
+        cooldown_frames=cooldown_frames,
+        allow_multi_action=allow_multi_action,
+        verbose=verbose,
+    )
+    self.two_way_clear_distance = float(two_way_clear_distance)
+    self.lane_key_search_distance = float(lane_key_search_distance)
+    self.side_hazard_distance = float(side_hazard_distance)
+    self.side_hazard_two_way_distance = float(side_hazard_two_way_distance)
+    self.roadblocked_distance = float(roadblocked_distance)
+    self.priority_distance = float(priority_distance)
+    self.yield_emergency_distance = float(yield_emergency_distance)
+    self.general_brake = bool(general_brake)
+
+  @classmethod
+  def from_env(cls) -> "PDMOraclePolicy":
+    action = os.environ.get("PDM_ORACLE_ACTION", os.environ.get("ORACLE_ACTION", os.environ.get("ACTIVATION_ACTION", "auto")))
+    alpha = float(
+        os.environ.get("PDM_ORACLE_ALPHA",
+                       os.environ.get("ORACLE_ALPHA", os.environ.get("STEERING_ALPHA", os.environ.get("ACTIVATION_ALPHA", 1.0)))))
+    return cls(
+        alpha=alpha,
+        action=action,
+        trigger_distance=float(os.environ.get("PDM_ORACLE_TRIGGER_DISTANCE", os.environ.get("ORACLE_TRIGGER_DISTANCE", 50.0))),
+        min_distance=float(os.environ.get("PDM_ORACLE_MIN_DISTANCE", os.environ.get("ORACLE_MIN_DISTANCE", 0.0))),
+        brake_hazard_distance=float(
+            os.environ.get("PDM_ORACLE_BRAKE_HAZARD_DISTANCE", os.environ.get("ORACLE_BRAKE_HAZARD_DISTANCE", 20.0))),
+        brake_hazard_lateral_margin=float(
+            os.environ.get("PDM_ORACLE_BRAKE_HAZARD_LATERAL_MARGIN",
+                           os.environ.get("ORACLE_BRAKE_HAZARD_LATERAL_MARGIN", 2.5))),
+        brake_reaction_time=float(
+            os.environ.get("PDM_ORACLE_BRAKE_REACTION_TIME", os.environ.get("ORACLE_BRAKE_REACTION_TIME", 0.4))),
+        brake_deceleration=float(
+            os.environ.get("PDM_ORACLE_BRAKE_DECELERATION", os.environ.get("ORACLE_BRAKE_DECELERATION", 6.0))),
+        brake_distance_margin=float(
+            os.environ.get("PDM_ORACLE_BRAKE_DISTANCE_MARGIN", os.environ.get("ORACLE_BRAKE_DISTANCE_MARGIN", 2.0))),
+        brake_ttc_threshold=float(
+            os.environ.get("PDM_ORACLE_BRAKE_TTC_THRESHOLD", os.environ.get("ORACLE_BRAKE_TTC_THRESHOLD", 2.0))),
+        brake_min_closing_speed=float(
+            os.environ.get("PDM_ORACLE_BRAKE_MIN_CLOSING_SPEED",
+                           os.environ.get("ORACLE_BRAKE_MIN_CLOSING_SPEED", 0.5))),
+        hold_frames=int(os.environ.get("PDM_ORACLE_HOLD_FRAMES", os.environ.get("ORACLE_HOLD_FRAMES", 8))),
+        cooldown_frames=int(os.environ.get("PDM_ORACLE_COOLDOWN_FRAMES", os.environ.get("ORACLE_COOLDOWN_FRAMES", 20))),
+        allow_multi_action=_strtobool(os.environ.get("PDM_ORACLE_ALLOW_MULTI_ACTION", os.environ.get("ORACLE_ALLOW_MULTI_ACTION"))),
+        verbose=_strtobool(os.environ.get("PDM_ORACLE_VERBOSE", os.environ.get("ORACLE_VERBOSE"))),
+        two_way_clear_distance=float(os.environ.get("PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE", 70.0)),
+        lane_key_search_distance=float(os.environ.get("PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE", 90.0)),
+        side_hazard_distance=float(os.environ.get("PDM_ORACLE_SIDE_HAZARD_DISTANCE", 25.0)),
+        side_hazard_two_way_distance=float(os.environ.get("PDM_ORACLE_SIDE_HAZARD_TWO_WAY_DISTANCE", 10.0)),
+        roadblocked_distance=float(os.environ.get("PDM_ORACLE_ROADBLOCKED_DISTANCE", 40.0)),
+        priority_distance=float(os.environ.get("PDM_ORACLE_PRIORITY_DISTANCE", 50.0)),
+        yield_emergency_distance=float(os.environ.get("PDM_ORACLE_YIELD_EMERGENCY_DISTANCE", 50.0)),
+        general_brake=_strtobool(os.environ.get("PDM_ORACLE_GENERAL_BRAKE")),
+    )
+
+  def _oracle_triggers(self) -> list[tuple[str, str, int | None, float]]:
+    try:
+      from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
+    except Exception:
+      return []
+
+    try:
+      ego = CarlaDataProvider.get_hero_actor()
+    except Exception:
+      ego = None
+    if ego is None or not getattr(ego, "is_alive", True):
+      return []
+
+    ego_location = ego.get_location()
+    scenarios = []
+    for scenario_type, scenario_data in list(getattr(CarlaDataProvider, "active_scenarios", [])):
+      actor = self._first_alive_actor(scenario_data)
+      if actor is None:
+        continue
+      distance = self._horizontal_distance(ego_location, actor.get_location())
+      scenarios.append((distance, scenario_type, scenario_data, actor))
+    scenarios.sort(key=lambda item: item[0])
+
+    triggers = []
+    for distance, scenario_type, scenario_data, actor in scenarios:
+      action = self._action_from_pdm_state(scenario_type, scenario_data, ego, actor, distance, CarlaDataProvider)
+      if action is None or not self._action_allowed(action):
+        continue
+      if self.min_distance <= distance <= self._distance_limit_for_scenario(scenario_type):
+        actor_id = getattr(actor, "id", None)
+        triggers.append((action, scenario_type, actor_id, distance))
+
+    if triggers or not self.general_brake:
+      return triggers
+
+    brake_actor = self._general_brake_actor(ego, CarlaDataProvider)
+    if brake_actor is None:
+      return triggers
+    distance = self._horizontal_distance(ego_location, brake_actor.get_location())
+    if self._action_allowed("brake"):
+      triggers.append(("brake", "GeneralActorBrake", getattr(brake_actor, "id", None), distance))
+    return triggers
+
+  def _distance_limit_for_scenario(self, scenario_type: str) -> float:
+    if scenario_type in ("HazardAtSideLane",):
+      return self.side_hazard_distance
+    if scenario_type in ("HazardAtSideLaneTwoWays",):
+      return self.side_hazard_two_way_distance
+    if scenario_type == "RoadBlocked":
+      return self.roadblocked_distance
+    if scenario_type in self.PRIORITY_BRAKE_SCENARIOS:
+      return self.priority_distance
+    if scenario_type == "YieldToEmergencyVehicle":
+      return self.yield_emergency_distance
+    return self.trigger_distance
+
+  def _action_from_pdm_state(self, scenario_type, scenario_data, ego, actor, distance, data_provider) -> str | None:
+    if scenario_type == "InvadingTurn":
+      offset = self._invading_turn_offset(scenario_data)
+      if offset is None:
+        return None
+      return "left" if offset > 0.0 else "right"
+
+    if scenario_type in self.ONE_WAY_LATERAL_SCENARIOS:
+      return self._lateral_action_from_direction(self._scenario_direction(scenario_data))
+
+    if scenario_type in self.TWO_WAY_LATERAL_SCENARIOS:
+      direction = self._scenario_direction(scenario_data)
+      if self._two_way_path_clear(ego, scenario_data, direction, data_provider):
+        return self._lateral_action_from_direction(direction)
+      if self._scenario_actor_brake_hazard(ego, actor):
+        return "brake"
+      return None
+
+    if scenario_type == "HazardAtSideLane":
+      # PDM-Lite shifts around the bicycles as if the obstacle is on the right.
+      return "left"
+
+    if scenario_type == "HazardAtSideLaneTwoWays":
+      if self._two_way_path_clear(ego, scenario_data, "right", data_provider):
+        return "left"
+      if self._scenario_actor_brake_hazard(ego, actor):
+        return "brake"
+      return None
+
+    if scenario_type == "YieldToEmergencyVehicle":
+      return self._yield_emergency_action(ego, data_provider)
+
+    if scenario_type == "RoadBlocked":
+      if distance <= self.roadblocked_distance:
+        return "brake"
+      return None
+
+    if scenario_type in self.PRIORITY_BRAKE_SCENARIOS:
+      if distance <= self.priority_distance and self._priority_actor_conflict(ego, actor, scenario_data):
+        return "brake"
+      return None
+
+    if self._scenario_actor_brake_hazard(ego, actor):
+      return "brake"
+    return None
+
+  @staticmethod
+  def _lateral_action_from_direction(direction: str | None) -> str | None:
+    if direction == "right":
+      return "left"
+    if direction == "left":
+      return "right"
+    return None
+
+  def _two_way_path_clear(self, ego, scenario_data, direction: str | None, data_provider) -> bool:
+    if direction not in ("left", "right"):
+      return False
+
+    world_map = self._get_map(data_provider)
+    if world_map is None:
+      return False
+
+    try:
+      ego_waypoint = world_map.get_waypoint(ego.get_location())
+    except Exception:
+      return False
+    if ego_waypoint is None:
+      return False
+
+    target_lane = ego_waypoint.get_left_lane() if direction == "right" else ego_waypoint.get_right_lane()
+    if target_lane is None:
+      return False
+
+    lane_keys = self._collect_lane_keys(target_lane, self.lane_key_search_distance)
+    if not lane_keys:
+      return False
+
+    ignored_ids = {getattr(actor, "id", None) for actor in self._alive_actors(scenario_data)}
+    ignored_ids.add(getattr(ego, "id", None))
+    ego_location = ego.get_location()
+    ego_forward = ego.get_transform().get_forward_vector()
+
+    for vehicle in self._vehicle_actors(data_provider):
+      if getattr(vehicle, "id", None) in ignored_ids or not getattr(vehicle, "is_alive", True):
+        continue
+      try:
+        vehicle_waypoint = world_map.get_waypoint(vehicle.get_location())
+      except Exception:
+        continue
+      if vehicle_waypoint is None:
+        continue
+      if (vehicle_waypoint.road_id, vehicle_waypoint.lane_id) not in lane_keys:
+        continue
+
+      vehicle_location = vehicle.get_location()
+      diff = vehicle_location - ego_location
+      longitudinal = diff.x * ego_forward.x + diff.y * ego_forward.y
+      if -5.0 <= longitudinal <= self.two_way_clear_distance:
+        return False
+    return True
+
+  def _collect_lane_keys(self, waypoint, distance: float) -> set[tuple[int, int]]:
+    lane_keys = set()
+    step = 2.0
+
+    def add_chain(start, method_name):
+      current = start
+      traveled = 0.0
+      while current is not None and traveled <= distance:
+        lane_keys.add((current.road_id, current.lane_id))
+        try:
+          next_waypoints = getattr(current, method_name)(step)
+        except Exception:
+          break
+        if not next_waypoints:
+          break
+        current = next_waypoints[0]
+        traveled += step
+
+    add_chain(waypoint, "next")
+    add_chain(waypoint, "previous")
+    return lane_keys
+
+  def _yield_emergency_action(self, ego, data_provider) -> str | None:
+    world_map = self._get_map(data_provider)
+    if world_map is None:
+      return None
+    try:
+      ego_waypoint = world_map.get_waypoint(ego.get_location())
+    except Exception:
+      return None
+    if ego_waypoint is None:
+      return None
+
+    # Mirrors the PDM-Lite rule: shift left unless the current waypoint only
+    # allows a right lane change. Avoid importing carla at module import time.
+    try:
+      import carla  # pylint: disable=import-outside-toplevel
+      if ego_waypoint.lane_change != carla.LaneChange.Right:
+        return "left"
+      return "right"
+    except Exception:
+      left_lane = ego_waypoint.get_left_lane()
+      return "left" if left_lane is not None else "right"
+
+  def _priority_actor_conflict(self, ego, actor, scenario_data) -> bool:
+    if actor is None or not getattr(actor, "is_alive", True):
+      return False
+    if actor.get_velocity().length() <= 0.1:
+      return False
+
+    ego_transform = ego.get_transform()
+    actor_location = actor.get_location()
+    ego_location = ego_transform.location
+    diff_x = actor_location.x - ego_location.x
+    diff_y = actor_location.y - ego_location.y
+    right = ego_transform.get_right_vector()
+    lateral = diff_x * right.x + diff_y * right.y
+    actor_side = "right" if lateral > 0.0 else "left"
+    direction = self._scenario_direction(scenario_data)
+    return direction is None or direction == actor_side
+
+  def _general_brake_actor(self, ego, data_provider):
+    for actor in self._vehicle_actors(data_provider) + self._walker_actors(data_provider):
+      if getattr(actor, "id", None) == getattr(ego, "id", None) or not getattr(actor, "is_alive", True):
+        continue
+      if self._scenario_actor_brake_hazard(ego, actor):
+        return actor
+    return None
+
+  @staticmethod
+  def _get_map(data_provider):
+    try:
+      return data_provider.get_map()
+    except Exception:
+      return None
+
+  @staticmethod
+  def _vehicle_actors(data_provider):
+    try:
+      world = data_provider.get_world()
+      if world is not None:
+        return list(world.get_actors().filter("vehicle.*"))
+    except Exception:
+      pass
+    try:
+      return [actor for _, actor in data_provider.get_actors() if getattr(actor, "type_id", "").startswith("vehicle.")]
+    except Exception:
+      return []
+
+  @staticmethod
+  def _walker_actors(data_provider):
+    try:
+      world = data_provider.get_world()
+      if world is not None:
+        return list(world.get_actors().filter("walker.*"))
+    except Exception:
+      pass
+    try:
+      return [actor for _, actor in data_provider.get_actors() if getattr(actor, "type_id", "").startswith("walker.")]
+    except Exception:
+      return []
+
+  @staticmethod
+  def _alive_actors(scenario_data):
+    if scenario_data is None:
+      return []
+    return [item for item in scenario_data if hasattr(item, "get_location") and getattr(item, "is_alive", True)]
+
+
 def policy_from_env(vlm_enabled: bool = False) -> ActivationPolicy:
   if vlm_enabled:
     return VLMPolicy(
@@ -365,6 +755,9 @@ def policy_from_env(vlm_enabled: bool = False) -> ActivationPolicy:
     )
 
   policy_name = os.environ.get("ACTIVATION_POLICY", os.environ.get("STEERING_POLICY", "")).lower()
+  if (policy_name in ("pdm_oracle", "pdm-oracle", "pdmoracle") or
+      _strtobool(os.environ.get("PDM_ORACLE_STEERING")) or _strtobool(os.environ.get("PDM_ORACLE_POLICY"))):
+    return PDMOraclePolicy.from_env()
   if policy_name == "oracle" or _strtobool(os.environ.get("ORACLE_STEERING")) or _strtobool(os.environ.get("ORACLE_POLICY")):
     return OraclePolicy.from_env()
 

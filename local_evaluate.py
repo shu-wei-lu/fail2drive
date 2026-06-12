@@ -12,8 +12,12 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
+import shlex
+import socket
 import subprocess
 import sys
+import time
 from typing import Iterable
 
 
@@ -49,7 +53,68 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--track", default="SENSORS", help="Leaderboard track passed to evaluator.")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
+    parser.add_argument("--traffic-manager-port", type=int, default=8000)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--evaluator-wall-timeout",
+        type=float,
+        default=0.0,
+        help="Optional wall-clock timeout for the evaluator subprocess. 0 disables it.",
+    )
+    parser.add_argument(
+        "--restart-carla",
+        action="store_true",
+        help="Start a fresh CARLA server for every route attempt and stop it afterwards.",
+    )
+    parser.add_argument(
+        "--carla-root",
+        default=os.environ.get("CARLA_ROOT", ""),
+        help="CARLA root directory. Defaults to $CARLA_ROOT.",
+    )
+    parser.add_argument(
+        "--carla-executable",
+        default="",
+        help="Path to CarlaUE4.sh. Defaults to <carla-root>/CarlaUE4.sh.",
+    )
+    parser.add_argument(
+        "--carla-startup-wait",
+        type=float,
+        default=60.0,
+        help="Seconds to wait after launching CARLA before starting the evaluator.",
+    )
+    parser.add_argument(
+        "--carla-shutdown-wait",
+        type=float,
+        default=5.0,
+        help="Seconds to wait after stopping CARLA before the next attempt.",
+    )
+    parser.add_argument(
+        "--port-free-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for CARLA/evaluator ports to become free before launching CARLA.",
+    )
+    parser.add_argument(
+        "--carla-streaming-port",
+        type=int,
+        default=0,
+        help="Optional CARLA streaming port. 0 lets CARLA use its default.",
+    )
+    parser.add_argument(
+        "--carla-nullrhi",
+        action="store_true",
+        help="Start CARLA with -nullrhi. Do not use this if the agent needs RGB cameras.",
+    )
+    parser.add_argument(
+        "--graphics-adapter",
+        default="",
+        help="Optional GPU index passed as -graphicsadapter=<index>.",
+    )
+    parser.add_argument(
+        "--carla-extra-args",
+        default="",
+        help="Extra CARLA launch args, parsed with shell-like quoting.",
+    )
     parser.add_argument(
         "--route-filter",
         default="",
@@ -102,8 +167,146 @@ def result_is_done(result_file: Path) -> bool:
     return not any(record.get("status") in RETRYABLE_STATUSES for record in records)
 
 
+def remove_incomplete_result(result_file: Path) -> None:
+    if not result_file.exists() or result_is_done(result_file):
+        return
+    try:
+        result_file.unlink()
+    except OSError as exc:
+        print(f"[warn] could not remove incomplete result {result_file}: {exc}")
+
+
 def tee_command(command: Iterable[str]) -> str:
     return " ".join(str(part) for part in command)
+
+
+def carla_executable(args: argparse.Namespace) -> Path:
+    if args.carla_executable:
+        return Path(args.carla_executable)
+    if not args.carla_root:
+        raise RuntimeError("--restart-carla requires --carla-root or CARLA_ROOT")
+    return Path(args.carla_root) / "CarlaUE4.sh"
+
+
+def carla_command(args: argparse.Namespace) -> list[str]:
+    executable = carla_executable(args)
+    if not executable.exists():
+        raise RuntimeError(f"CARLA executable not found: {executable}")
+
+    binary = executable.parent / "CarlaUE4" / "Binaries" / "Linux" / "CarlaUE4-Linux-Shipping"
+    if executable.name == "CarlaUE4.sh" and binary.exists():
+        binary.chmod(binary.stat().st_mode | 0o111)
+        command = [str(binary), "CarlaUE4"]
+    elif executable.suffix == ".sh":
+        command = ["bash", str(executable)]
+    else:
+        command = [str(executable)]
+
+    command.extend(
+        [
+            f"-carla-rpc-port={args.port}",
+            "-nosound",
+            "-carla-primary-port=0",
+        ]
+    )
+    if args.carla_streaming_port:
+        command.append(f"-carla-streaming-port={args.carla_streaming_port}")
+    if args.carla_nullrhi:
+        command.append("-nullrhi")
+    else:
+        command.append("-RenderOffscreen")
+    if args.graphics_adapter:
+        command.append(f"-graphicsadapter={args.graphics_adapter}")
+    if args.carla_extra_args:
+        command.extend(shlex.split(args.carla_extra_args))
+    return command
+
+
+def socket_port_is_free(port: int, socket_type: int) -> bool:
+    if port <= 0:
+        return True
+    with socket.socket(socket.AF_INET, socket_type) as sock:
+        try:
+            sock.bind(("", port))
+        except OSError:
+            return False
+    return True
+
+
+def port_is_free(port: int) -> bool:
+    return socket_port_is_free(port, socket.SOCK_STREAM) and socket_port_is_free(port, socket.SOCK_DGRAM)
+
+
+def required_ports(args: argparse.Namespace) -> list[int]:
+    ports = [args.port, args.traffic_manager_port]
+    if args.carla_streaming_port:
+        ports.append(args.carla_streaming_port)
+    return sorted(set(ports))
+
+
+def wait_for_free_ports(args: argparse.Namespace) -> None:
+    deadline = time.monotonic() + args.port_free_timeout
+    ports = required_ports(args)
+    while True:
+        busy_ports = [port for port in ports if not port_is_free(port)]
+        if not busy_ports:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"ports still in use after {args.port_free_timeout:.1f}s: {busy_ports}")
+        time.sleep(1.0)
+
+
+def start_carla(args: argparse.Namespace, log_file: Path) -> subprocess.Popen:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    wait_for_free_ports(args)
+    command = carla_command(args)
+    log = log_file.open("a", encoding="utf-8")
+    log.write(f"\n[local_evaluate] starting CARLA: {tee_command(command)}\n")
+    log.flush()
+    process = subprocess.Popen(
+        command,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    process._local_evaluate_log = log  # type: ignore[attr-defined]
+    time.sleep(args.carla_startup_wait)
+    if process.poll() is not None:
+        log.close()
+        raise RuntimeError(f"CARLA exited during startup with code {process.returncode}")
+    return process
+
+
+def stop_carla(process: subprocess.Popen, args: argparse.Namespace, timeout: float = 20.0) -> None:
+    log = getattr(process, "_local_evaluate_log", None)
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+            deadline = time.monotonic() + args.port_free_timeout
+            while process.poll() is None and time.monotonic() < deadline:
+                if not [port for port in required_ports(args) if not port_is_free(port)]:
+                    break
+                time.sleep(1.0)
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=timeout)
+        except ProcessLookupError:
+            pass
+    try:
+        wait_for_free_ports(args)
+    except RuntimeError as exc:
+        if log is not None:
+            log.write(f"[local_evaluate] warning after stopping CARLA: {exc}\n")
+    if log is not None:
+        log.write(f"[local_evaluate] stopped CARLA returncode={process.returncode}\n")
+        log.close()
 
 
 def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) -> int:
@@ -136,6 +339,7 @@ def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) ->
         f"--agent-config={args.agent_config}",
         f"--host={args.host}",
         f"--port={args.port}",
+        f"--traffic-manager-port={args.traffic_manager_port}",
         f"--traffic-manager-seed={route_seed}",
     ]
 
@@ -143,7 +347,27 @@ def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) ->
         stdout.write(f"\n[local_evaluate] attempt={attempt} seed={seed} route={route.name}\n")
         stdout.write(f"[local_evaluate] command={tee_command(command)}\n")
         stdout.flush()
-        return subprocess.run(command, stdout=stdout, stderr=stderr, check=False).returncode
+        process = subprocess.Popen(
+            command,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        try:
+            return process.wait(timeout=args.evaluator_wall_timeout or None)
+        except subprocess.TimeoutExpired:
+            stdout.write(
+                f"[local_evaluate] evaluator timed out after "
+                f"{args.evaluator_wall_timeout:.1f}s; killing process group\n"
+            )
+            stdout.flush()
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=20.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=20.0)
+            return process.returncode
 
 
 def main() -> int:
@@ -153,7 +377,10 @@ def main() -> int:
     current = 0
 
     print(f"Running {len(routes)} routes x {len(args.seeds)} seeds = {total} evaluations")
-    print("CARLA must already be running and reachable at " f"{args.host}:{args.port}")
+    if args.restart_carla:
+        print("CARLA will be restarted for every route attempt at " f"{args.host}:{args.port}")
+    else:
+        print("CARLA must already be running and reachable at " f"{args.host}:{args.port}")
 
     for seed in args.seeds:
         for route in routes:
@@ -166,8 +393,27 @@ def main() -> int:
                 continue
 
             for attempt in range(1, args.retries + 1):
+                if attempt > 1 or args.force:
+                    remove_incomplete_result(result_file)
                 print(f"[{current}/{total}] run seed={seed} route={route.name} attempt={attempt}")
-                return_code = run_route(args, route, seed, attempt)
+                carla_process = None
+                return_code = 1
+                try:
+                    if args.restart_carla:
+                        carla_log = (
+                            Path(args.out_root)
+                            / str(seed)
+                            / "out"
+                            / f"{route_id}_carla_attempt{attempt}.log"
+                        )
+                        carla_process = start_carla(args, carla_log)
+                    return_code = run_route(args, route, seed, attempt)
+                except RuntimeError as exc:
+                    print(f"[warn] CARLA failed to start for seed={seed} route={route.name}: {exc}")
+                finally:
+                    if carla_process is not None:
+                        stop_carla(carla_process, args)
+                        time.sleep(args.carla_shutdown_wait)
                 if result_is_done(result_file):
                     break
                 print(

@@ -567,10 +567,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           self.vlm_last_decision,
           decision_age_frames=decision_age_frames)
       if self.vlm_last_decision is not None:
-        if self.vlm_gate.verbose and steering_alpha > 0.0:
+        if self.vlm_gate.verbose and self._activation_alpha_active(steering_alpha):
           print(
               f"[VLMGate] use step={self.step} decision_frame={self.vlm_last_decision.frame_id} "
-              f"age={decision_age_frames} alpha={steering_alpha:.3f} reason={self.vlm_last_decision.reason}",
+              f"age={decision_age_frames} action={getattr(self.vlm_last_decision, 'action', 'none')} "
+              f"alpha={self._format_activation_alpha(steering_alpha)} reason={self.vlm_last_decision.reason}",
               flush=True)
       elif self.vlm_gate.verbose:
         print(f"[VLMGate] use step={self.step} no completed decision yet; alpha=0.000", flush=True)
@@ -1011,6 +1012,29 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     else:
       return float(activation_alpha)
     return [float(value) for value in activation_alpha]
+
+  @staticmethod
+  def _activation_alpha_active(activation_alpha):
+    if activation_alpha is None:
+      return False
+    if hasattr(activation_alpha, 'detach'):
+      values = activation_alpha.detach().cpu().flatten().tolist()
+    elif isinstance(activation_alpha, np.ndarray):
+      values = activation_alpha.reshape(-1).tolist()
+    elif isinstance(activation_alpha, (list, tuple)):
+      values = list(activation_alpha)
+    else:
+      return float(activation_alpha) > 0.0
+    return any(float(value) > 0.0 for value in values)
+
+  @classmethod
+  def _format_activation_alpha(cls, activation_alpha):
+    value = cls._json_activation_alpha(activation_alpha)
+    if isinstance(value, list):
+      return '[' + ', '.join(f'{float(item):.3f}' for item in value) + ']'
+    if value is None:
+      return 'None'
+    return f'{float(value):.3f}'
 
   def _display_debug_output(self, image):
     if not self.live_visu or self._quit_requested:

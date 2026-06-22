@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+import io
 import json
 import os
 from pathlib import Path
 import queue
 import re
+import sys
 import threading
 import time
 import traceback
 from typing import Optional
+import urllib.error
+import urllib.request
 
 import numpy as np
 from PIL import Image
@@ -23,6 +28,7 @@ class VLMDecision:
   frame_id: int
   enable_steering: bool
   steering_alpha: float = 0.0
+  action: str = "none"
   reason: str = ""
   raw_response: str = ""
   timestamp: float = 0.0
@@ -52,7 +58,10 @@ class AsyncVLMGate:
                prompt: Optional[str] = None,
                verbose: bool = False,
                save_inputs: bool = False,
-               input_save_dir: str = "vlm_inputs"):
+               input_save_dir: str = "vlm_inputs",
+               binary_threshold: float = 0.5,
+               confidence_threshold: float = 0.6,
+               server_url: str = "http://127.0.0.1:8765/generate"):
     self.model_name = model_name
     self.every_n = max(int(every_n), 1)
     self.max_new_tokens = int(max_new_tokens)
@@ -64,6 +73,9 @@ class AsyncVLMGate:
     self.verbose = verbose
     self.save_inputs = save_inputs
     self.input_save_dir = Path(input_save_dir)
+    self.binary_threshold = float(binary_threshold)
+    self.confidence_threshold = float(confidence_threshold)
+    self.server_url = server_url
     if self.save_inputs:
       self.input_save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,6 +87,11 @@ class AsyncVLMGate:
     self._processor = None
     self._tokenizer = None
     self._model = None
+    self._alpamayo_helper = None
+    self._alpamayo_logits_processor_cls = None
+    self._alpamayo_stop_after_eos_cls = None
+    self._alpamayo_replace_padding_after_eos = None
+    self._alpamayo_to_special_token = None
     self._internvl_pixel_dtype = torch.bfloat16
     self._previous_decision_image: Optional[Image.Image] = None
     self._previous_decision_frame_id: Optional[int] = None
@@ -98,7 +115,10 @@ class AsyncVLMGate:
         prompt=os.environ.get("VLM_PROMPT", None),
         verbose=str(os.environ.get("VLM_VERBOSE", "1")).lower() in ("1", "true", "yes", "y"),
         save_inputs=str(os.environ.get("VLM_SAVE_INPUTS", "0")).lower() in ("1", "true", "yes", "y"),
-        input_save_dir=os.environ.get("VLM_INPUT_SAVE_DIR", "vlm_inputs"))
+        input_save_dir=os.environ.get("VLM_INPUT_SAVE_DIR", "vlm_inputs"),
+        binary_threshold=float(os.environ.get("VLM_BINARY_THRESHOLD", 0.5)),
+        confidence_threshold=float(os.environ.get("VLM_CONF_THRESHOLD", 0.6)),
+        server_url=os.environ.get("VLM_SERVER_URL", os.environ.get("ALPAMAYO_SERVER_URL", "http://127.0.0.1:8765/generate")))
 
   def start(self):
     if self._thread is not None:
@@ -158,6 +178,7 @@ class AsyncVLMGate:
           frame_id=-1,
           enable_steering=False,
           steering_alpha=0.0,
+          action="none",
           reason="VLM initialization failed",
           timestamp=time.time(),
           error=f"{type(exc).__name__}: {exc}"))
@@ -177,6 +198,7 @@ class AsyncVLMGate:
             frame_id=request.frame_id,
             enable_steering=False,
             steering_alpha=0.0,
+            action="none",
             reason="VLM inference failed",
             timestamp=time.time(),
             error=f"{type(exc).__name__}: {exc}")
@@ -187,11 +209,17 @@ class AsyncVLMGate:
         raw_response = decision.raw_response.replace("\n", " ")[:500]
         print(
             f"[VLMGate] result frame={decision.frame_id} alpha={decision.steering_alpha:.3f} "
-            f"enable={decision.enable_steering} reason={decision.reason} "
+            f"action={decision.action} enable={decision.enable_steering} reason={decision.reason} "
             f"error={decision.error} raw={raw_response}",
             flush=True)
 
   def _load_model(self):
+    if self.backend == "alpamayo_server":
+      print(f"AsyncVLMGate loaded backend=alpamayo_server url={self.server_url}", flush=True)
+      return
+    if self.backend == "alpamayo":
+      self._load_alpamayo_model()
+      return
     if self.backend == "internvl":
       self._load_internvl_model()
       return
@@ -258,10 +286,47 @@ class AsyncVLMGate:
     quantization = self.quantization if self.quantization else "none"
     print(f"AsyncVLMGate loaded backend=internvl model={self.model_name} quantization={quantization}", flush=True)
 
+  def _load_alpamayo_model(self):
+    self._ensure_alpamayo_on_path()
+
+    from alpamayo_r1 import helper
+    from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1, ExpertLogitsProcessor
+    from alpamayo_r1.models.token_utils import (
+        StopAfterEOS,
+        replace_padding_after_eos,
+        to_special_token,
+    )
+
+    dtype = self._resolve_dtype(self.torch_dtype)
+    if dtype == "auto":
+      dtype = torch.bfloat16
+    if self.quantization not in ("", "none", "0"):
+      print("[VLMGate] Alpamayo backend ignores VLM_QUANTIZATION; load it on a suitable device.", flush=True)
+
+    model_name = os.environ.get("VLM_ALPAMAYO_MODEL", self.model_name)
+    self._model = AlpamayoR1.from_pretrained(model_name, dtype=dtype)
+    if self.device != "cpu":
+      self._model.to(self.device)
+    else:
+      self._model.to("cpu")
+    self._model.eval()
+    self._processor = helper.get_processor(self._model.tokenizer)
+    self._tokenizer = self._model.tokenizer
+    self._alpamayo_helper = helper
+    self._alpamayo_logits_processor_cls = ExpertLogitsProcessor
+    self._alpamayo_stop_after_eos_cls = StopAfterEOS
+    self._alpamayo_replace_padding_after_eos = replace_padding_after_eos
+    self._alpamayo_to_special_token = to_special_token
+    print(f"AsyncVLMGate loaded backend=alpamayo model={model_name}", flush=True)
+
   def _run_inference(self, request: _VLMRequest) -> VLMDecision:
     image = self._to_pil_image(request.rgb_image)
     prompt = self._format_prompt(request)
     self._save_input_image(image, request, prompt)
+    if self.backend == "alpamayo_server":
+      return self._run_alpamayo_server_inference(image, prompt, request)
+    if self.backend == "alpamayo":
+      return self._run_alpamayo_inference(image, prompt, request.frame_id)
     if self.backend == "internvl":
       images = [image]
       if self._previous_decision_image is not None:
@@ -294,6 +359,171 @@ class AsyncVLMGate:
     decision.raw_response = raw_response
     decision.timestamp = time.time()
     return decision
+
+  def _run_alpamayo_server_inference(self, image: Image.Image, prompt: str, request: _VLMRequest) -> VLMDecision:
+    payload = {
+        "frame_id": request.frame_id,
+        "image_base64": self._image_to_base64_png(image),
+        "prompt": prompt,
+        "speed": request.speed,
+        "command": request.command,
+        "target_point": request.target_point,
+        "max_new_tokens": self.max_new_tokens,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    http_request = urllib.request.Request(
+        self.server_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST")
+    timeout_s = float(os.environ.get("VLM_SERVER_TIMEOUT_S", 300.0))
+    try:
+      with urllib.request.urlopen(http_request, timeout=timeout_s) as response:
+        response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+      error_body = exc.read().decode("utf-8", errors="replace")
+      raise RuntimeError(f"Alpamayo server HTTP {exc.code}: {error_body}") from exc
+    except urllib.error.URLError as exc:
+      raise RuntimeError(f"Alpamayo server request failed: {exc}") from exc
+
+    raw_response = str(response_data.get("raw_response", ""))
+    if "action" in response_data:
+      parse_payload = {
+          "action": response_data.get("action"),
+          "confidence": response_data.get("confidence", 1.0),
+          "reason": response_data.get("reason", ""),
+      }
+      decision = self._parse_response(json.dumps(parse_payload), request.frame_id)
+    else:
+      decision = self._parse_response(raw_response, request.frame_id)
+    decision.raw_response = raw_response or json.dumps(response_data)
+    decision.timestamp = time.time()
+    return decision
+
+  @staticmethod
+  def _image_to_base64_png(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+  def _run_alpamayo_inference(self, image: Image.Image, prompt: str, frame_id: int) -> VLMDecision:
+    from transformers import StoppingCriteriaList
+    from transformers.generation.logits_process import LogitsProcessorList
+
+    messages = self._create_alpamayo_messages(image, prompt)
+    inputs = self._processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        continue_final_message=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    ego_history_xyz, ego_history_rot = self._alpamayo_stationary_history()
+    inputs = self._alpamayo_helper.to_device(inputs, self.device)
+    input_ids = inputs.pop("input_ids")
+    input_ids = self._model.fuse_traj_tokens(
+        input_ids,
+        {
+            "ego_history_xyz": ego_history_xyz.to(self.device),
+            "ego_history_rot": ego_history_rot.to(self.device),
+        })
+
+    eos_token_id = self._tokenizer.convert_tokens_to_ids(
+        self._alpamayo_to_special_token("traj_future_start"))
+    generation_config = self._model.vlm.generation_config
+    generation_config.do_sample = str(os.environ.get("VLM_ALPAMAYO_DO_SAMPLE", "0")).lower() in ("1", "true", "yes", "y")
+    generation_config.max_new_tokens = self.max_new_tokens
+    generation_config.num_return_sequences = 1
+    generation_config.output_logits = False
+    generation_config.return_dict_in_generate = True
+    generation_config.pad_token_id = self._tokenizer.pad_token_id
+    logits_processor = LogitsProcessorList([
+        self._alpamayo_logits_processor_cls(
+            traj_token_offset=self._model.config.traj_token_start_idx,
+            traj_vocab_size=self._model.config.traj_vocab_size,
+        )
+    ])
+
+    with torch.inference_mode():
+      outputs = self._model.vlm.generate(
+          input_ids=input_ids,
+          generation_config=generation_config,
+          stopping_criteria=StoppingCriteriaList([
+              self._alpamayo_stop_after_eos_cls(eos_token_id=eos_token_id)
+          ]),
+          logits_processor=logits_processor,
+          **inputs)
+
+    sequences = self._alpamayo_replace_padding_after_eos(
+        token_ids=outputs.sequences,
+        eos_token_id=eos_token_id,
+        pad_token_id=self._tokenizer.pad_token_id)
+    generated_ids = sequences[:, input_ids.shape[1]:]
+    raw_response = self._tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False)[0]
+    decision = self._parse_response(raw_response, frame_id)
+    decision.raw_response = raw_response
+    decision.timestamp = time.time()
+    return decision
+
+  def _ensure_alpamayo_on_path(self):
+    candidates = []
+    repo_path = os.environ.get("VLM_ALPAMAYO_REPO", os.environ.get("ALPAMAYO_REPO"))
+    src_path = os.environ.get("VLM_ALPAMAYO_SRC", os.environ.get("ALPAMAYO_SRC"))
+    if src_path:
+      candidates.append(Path(src_path))
+    if repo_path:
+      candidates.append(Path(repo_path) / "src")
+    candidates.append(Path(__file__).resolve().parents[2].parent / "alpamayo" / "src")
+
+    for candidate in candidates:
+      if candidate.exists():
+        candidate_str = str(candidate)
+        if candidate_str not in sys.path:
+          sys.path.insert(0, candidate_str)
+        return
+
+  def _create_alpamayo_messages(self, image: Image.Image, prompt: str):
+    num_traj_token = int(os.environ.get("VLM_ALPAMAYO_HISTORY_PLACEHOLDER_TOKENS", 48))
+    hist_traj_placeholder = (
+        f"<|traj_history_start|>{'<|traj_history|>' * num_traj_token}<|traj_history_end|>"
+    )
+    text = (
+        f"{hist_traj_placeholder}{prompt}\n"
+        "Return the final decision as strict JSON with one action field: "
+        "{\"action\":\"none|brake|left|right\",\"reason\":\"...\"}. "
+        "Use left for a left lane-change intervention and right for a right lane-change intervention."
+    )
+    return [
+        {
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": "You are a driving assistant that chooses safe activation-steering interventions.",
+            }],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": text},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "<|cot_start|>"}],
+        },
+    ]
+
+  def _alpamayo_stationary_history(self):
+    num_history_steps = int(os.environ.get("VLM_ALPAMAYO_HISTORY_STEPS", 16))
+    ego_history_xyz = torch.zeros((1, 1, num_history_steps, 3), dtype=torch.float32)
+    eye = torch.eye(3, dtype=torch.float32)
+    ego_history_rot = eye.reshape(1, 1, 1, 3, 3).repeat(1, 1, num_history_steps, 1, 1)
+    return ego_history_xyz, ego_history_rot
 
   def _run_internvl_inference(self, images: list[Image.Image], prompt: str, frame_id: int) -> VLMDecision:
     pixel_values_list = []
@@ -407,34 +637,137 @@ class AsyncVLMGate:
   def _parse_response(self, response: str, frame_id: int) -> VLMDecision:
     data = self._extract_json(response)
     if data is None:
-      lowered = response.lower()
-      steering_alpha = self._command_to_alpha(lowered)
-      enable = steering_alpha > 0.0
+      action = self._text_to_action(response)
       reason = response.strip()[:160]
     else:
-      steering_alpha = self._extract_command_alpha(data)
-      enable = steering_alpha > 0.0
+      action = self._extract_action(data)
+      confidence = self._extract_confidence(data)
+      if confidence is not None and confidence < self.confidence_threshold:
+        action = "none"
       reason = self._format_reason(data)
 
+    action = self._normalize_action(action)
+    steering_alpha = 1.0 if action != "none" else 0.0
     return VLMDecision(
         frame_id=frame_id,
-        enable_steering=enable,
+        enable_steering=steering_alpha > 0.0,
         steering_alpha=steering_alpha,
+        action=action,
         reason=reason)
 
   @classmethod
   def _extract_command_alpha(cls, data: dict) -> float:
     command = data.get("cmd", data.get("high_level_command", ""))
-    return cls._command_to_alpha(str(command).strip().lower())
+    return 1.0 if cls._command_to_action(str(command).strip().lower()) != "none" else 0.0
+
+  def _extract_action(self, data: dict) -> str:
+    for key in (
+        "action",
+        "activation_action",
+        "steering_action",
+        "intervention_action",
+        "cmd",
+        "high_level_command",
+        "command",
+        "decision"):
+      value = data.get(key)
+      if value is None:
+        continue
+      action = self._normalize_action(str(value))
+      if action != "none":
+        return action
+      if self._is_explicit_no_action(str(value)):
+        return "none"
+
+    action_vector = data.get("action_vector", data.get("activation_alpha", None))
+    vector_action = self._action_from_vector(action_vector)
+    if vector_action != "none":
+      return vector_action
+
+    score = self._extract_normalized_risk_score(data)
+    if score >= self.binary_threshold:
+      return self._fallback_action(data)
+    return "none"
+
+  @classmethod
+  def _text_to_action(cls, text: str) -> str:
+    lowered = text.lower()
+    for pattern in (
+        r"\baction\s*[:=]\s*['\"]?([a-zA-Z_ -]+)",
+        r"\bcmd\s*[:=]\s*['\"]?([a-zA-Z_ -]+)",
+        r"\bcommand\s*[:=]\s*['\"]?([a-zA-Z_ -]+)",
+    ):
+      match = re.search(pattern, lowered)
+      if match:
+        action = cls._normalize_action(match.group(1))
+        if action != "none" or cls._is_explicit_no_action(match.group(1)):
+          return action
+    if re.search(r"\b(change|move|merge)\s+(to\s+)?(the\s+)?left\b", lowered):
+      return "left"
+    if re.search(r"\b(change|move|merge)\s+(to\s+)?(the\s+)?right\b", lowered):
+      return "right"
+    if re.search(r"\b(stop|brake|yield|emergency brake)\b", lowered):
+      return "brake"
+    return "none"
+
+  @classmethod
+  def _command_to_action(cls, command: str) -> str:
+    normalized = re.sub(r"[^a-z_]+", "", command.lower())
+    if normalized in ("stop", "brake", "yield", "emergency_brake", "emergencybrake"):
+      return "brake"
+    if normalized in ("l_change", "lchange", "left", "left_change", "leftchange", "change_lane_left", "changelaneleft"):
+      return "left"
+    if normalized in ("r_change", "rchange", "right", "right_change", "rightchange", "change_lane_right", "changelaneright"):
+      return "right"
+    return "none"
+
+  @classmethod
+  def _normalize_action(cls, action: str | None) -> str:
+    if action is None:
+      return "none"
+    normalized = cls._command_to_action(action)
+    if normalized != "none":
+      return normalized
+    value = re.sub(r"[^a-z_]+", "", str(action).lower())
+    if value in ("none", "no", "go", "keep", "normal", "no_steering", "nosteering", "no_action", "noaction"):
+      return "none"
+    return "none"
 
   @staticmethod
-  def _command_to_alpha(command: str) -> float:
-    normalized = re.sub(r"[^a-z_]+", "", command.lower())
-    if normalized in ("stop", "emergency_brake", "emergencybrake"):
-      return 1.0
-    if normalized == "yield":
-      return 0.5
-    return 0.0
+  def _is_explicit_no_action(value: str) -> bool:
+    normalized = re.sub(r"[^a-z_]+", "", value.lower())
+    return normalized in ("none", "no", "go", "keep", "normal", "no_steering", "nosteering", "no_action", "noaction")
+
+  def _action_from_vector(self, value) -> str:
+    if value is None:
+      return "none"
+    try:
+      vector = np.asarray(value, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+      return "none"
+    if vector.size != 3:
+      return "none"
+    index = int(np.argmax(vector))
+    if float(vector[index]) < self.binary_threshold:
+      return "none"
+    return ("brake", "left", "right")[index]
+
+  def _fallback_action(self, data: dict) -> str:
+    position = str(data.get("object_position", data.get("blocking_object_position", ""))).lower()
+    if "left" in position:
+      return "right"
+    if "right" in position:
+      return "left"
+    return "brake"
+
+  @classmethod
+  def _extract_confidence(cls, data: dict) -> Optional[float]:
+    if "confidence" not in data:
+      return None
+    value = cls._coerce_float(data.get("confidence"), 1.0)
+    if value > 1.0:
+      value = value / 100.0
+    return float(np.clip(value, 0.0, 1.0))
 
   @classmethod
   def _extract_normalized_risk_score(cls, data: dict) -> float:
@@ -578,11 +911,13 @@ class AsyncVLMGate:
   def _resolve_backend(backend: str, model_name: str) -> str:
     backend = backend.lower()
     if backend == "auto":
+      if "alpamayo" in model_name.lower():
+        return "alpamayo"
       if "internvl" in model_name.lower():
         return "internvl"
       return "qwen"
-    if backend not in ("qwen", "internvl"):
-      raise ValueError("VLM_BACKEND must be one of: auto, qwen, internvl")
+    if backend not in ("qwen", "internvl", "alpamayo", "alpamayo_server"):
+      raise ValueError("VLM_BACKEND must be one of: auto, qwen, internvl, alpamayo, alpamayo_server")
     return backend
 
   @staticmethod
@@ -694,7 +1029,7 @@ class AsyncVLMGate:
   def _default_prompt() -> str:
     return """
 Role: Autonomous Driving Commander. Speed: {CURRENT_SPEED} km/h. Intent: {NAV_COMMAND}.
-Task: Output safest next action. Do NOT use full sentences.
+Task: Output the safest activation-steering intervention. Do NOT use full sentences.
 Image input:
 - First image is previous frame, second image is current frame.
 - {TEMPORAL_CONTEXT}
@@ -708,7 +1043,8 @@ Output strictly valid JSON.
   "object_position": "ego_lane / left_lane / right_lane / shoulder / unknown",
   "distance": "near / mid / far",
   "left_lane_clear": true/false/unknown,
-  "right_lane_clear": true/false/unknown
-  "cmd": "<EXACTLY ONE: GO, YIELD, STOP, L_CHANGE, R_CHANGE>"
+  "right_lane_clear": true/false/unknown,
+  "action": "<EXACTLY ONE: none, brake, left, right>",
+  "reason": "..."
 }
 """

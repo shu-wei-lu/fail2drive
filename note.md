@@ -15,21 +15,7 @@ python leaderboard/leaderboard/leaderboard_evaluator_local.py \
   --agent-config ./checkpoints/tfpp
 
 #
-VLM_STEERING=True \
-VLM_BACKEND=internvl  \
-VLM_MODEL=OpenGVLab/InternVL3_5-8B \
-VLM_DEVICE=cuda:1 \
-VLM_LOAD_IN_8BIT=1 \
-VLM_MAX_NEW_TOKENS=256 \
-VLM_EVERY_N=1 \
-VLM_DECAY_FRAMES=15 \
-VLM_SAVE_INPUTS=0 \
-VLM_VERBOSE=1 \
-VLM_ALPHA_MAX=5 \
-VLM_ALPHA_MAPPING=piecewise \
-VLM_ALPHA_POINTS="0:0,0.3:1.0,0.5:3.0,0.7:4.5,1.0:5.0" \
-ACTIVATION_VECTOR_PATH=./steering_feats/brake_minus_normal.pt \
-NORMALIZE_STEERING_VECTOR=0 \
+
 LIVE_VISU=0 \
 DEBUG_CHALLENGE=1 \
 SAVE_PATH=./viz_vehicle \
@@ -111,15 +97,7 @@ python calibrate_steering_alpha.py \
   --target-speed-threshold 1.0 \
   --success-ratio 0.95
   --live-visu
-
-# VLM
-VLM_STEERING=True \
-VLM_ALPHA_MAX=5 \
-VLM_ALPHA_MAPPING=piecewise \
-VLM_ALPHA_POINTS="0:0,0.3:0,0.5:3.5,0.7:4.5,1.0:5.0"
-
-LIVE_VISU=0 SAVE_PATH=./viz_vehicle DEBUG_CHALLENGE=1 python leaderboard/leaderboard/leaderboard_evaluator_local.py   --routes ./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml   --agent ./team_code/sensor_agent.py   --agent-config ./checkpoints/tfpp 
-
+  
 # VAD
 LIVE_VISU=0 DEBUG_CHALLENGE=1 SAVE_PATH=./viz_vehicle python leaderboard/leaderboard/leaderboard_evaluator_local.py   --routes ./steering_split/vehicle_on_road/Steering_VehicleOnRoad_1086.xml   --agent ./team_code/vad_f2d_agent.py --agent-config "../Bench2DriveZoo/adzoo/vad/configs/VAD/VAD_base_e2e_b2d.py+./checkpoints/vad/vad_b2d_base.pth+vad_f2d"
 
@@ -133,3 +111,16 @@ ORACLE_COOLDOWN_FRAMES=10 \
 ACTIVATION_VECTOR_PATHS="./steering/transfuser/post_process/Brake/steering_vector.pt,./steering/transfuser/post_process/left_change_lane/steering_vector.pt,./steering/transfuser/post_process/right_change_lane/steering_vector.pt" \
 NORMALIZE_STEERING_VECTOR=0 \
 python leaderboard/leaderboard/leaderboard_evaluator_local.py ...
+
+# Slurm evaluate
+CARLA_ROOT="$PWD/f2d_carla" \
+LIVE_VISU=0 \
+DEBUG_CHALLENGE=0 \
+python -u slurm_evaluate.py \
+  --routes fail2drive_split \
+  --seeds 1 \
+  --retries 1 \
+  --out_root results/transfuser \
+  --agent_file team_code/sensor_agent.py \
+  --agent_config checkpoints/tfpp \
+  --lb_script leaderboard/leaderboard/leaderboard_evaluator_local.py

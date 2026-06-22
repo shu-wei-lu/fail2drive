@@ -61,6 +61,9 @@ class FixedAfterFramePolicy(ActivationPolicy):
 
 
 class VLMPolicy(ActivationPolicy):
+  ACTIONS = ("brake", "left", "right")
+  ACTION_INDEX = {action: index for index, action in enumerate(ACTIONS)}
+
   def __init__(
       self,
       alpha_max: float = 1.0,
@@ -69,43 +72,42 @@ class VLMPolicy(ActivationPolicy):
       gamma: float = 1.0,
       points: str | None = None,
       decay_frames: int = 10,
+      ttl_frames: int | None = None,
   ):
-    self.alpha_max = float(alpha_max)
-    self.mapping = mapping
-    self.deadzone = _clip01(deadzone)
-    self.gamma = float(gamma)
-    self.points = _parse_points(points) if points else None
-    self.decay_frames = int(decay_frames)
+    # VLM steering is binary and action-specific: [brake, left, right].
+    # Keep the old constructor arguments accepted so existing launch scripts do
+    # not fail, but do not map VLM scores into fractional alphas anymore.
+    self.ttl_frames = int(decay_frames if ttl_frames is None else ttl_frames)
 
-  def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> float:
+  def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
+    alpha_vector = [0.0 for _ in self.ACTIONS]
     if vlm_decision is None:
-      return 0.0
-    score = _clip01(vlm_decision.steering_alpha)
-    if score <= self.deadzone:
-      return 0.0
+      return alpha_vector
+    if self.ttl_frames > 0 and decision_age_frames is not None and decision_age_frames > self.ttl_frames:
+      return alpha_vector
 
-    if self.mapping == "linear":
-      mapped = score * self.alpha_max
-    elif self.mapping == "power":
-      scaled = (score - self.deadzone) / max(1.0 - self.deadzone, 1e-6)
-      mapped = self.alpha_max * (scaled ** self.gamma)
-    elif self.mapping == "piecewise":
-      points = self.points or [
-          (0.0, 0.0),
-          (0.3, 0.0),
-          (0.6, 4.0),
-          (0.8, 4.5),
-          (1.0, self.alpha_max),
-      ]
-      mapped = _interp(points, score)
-    else:
-      raise ValueError("VLM_ALPHA_MAPPING must be one of: linear, power, piecewise")
+    action = self._decision_action(vlm_decision)
+    if action not in self.ACTION_INDEX:
+      return alpha_vector
+    if getattr(vlm_decision, "steering_alpha", 0.0) <= 0.0 and not getattr(vlm_decision, "enable_steering", False):
+      return alpha_vector
 
-    if decision_age_frames is not None and self.decay_frames > 0:
-      decay = max(0.0, 1.0 - (float(decision_age_frames) / float(self.decay_frames)))
-      mapped = mapped * decay
+    alpha_vector[self.ACTION_INDEX[action]] = 1.0
+    return alpha_vector
 
-    return max(0.0, min(self.alpha_max, float(mapped)))
+  @classmethod
+  def _decision_action(cls, vlm_decision) -> str | None:
+    action = getattr(vlm_decision, "action", None)
+    if action is None:
+      return "brake" if getattr(vlm_decision, "steering_alpha", 0.0) > 0.0 else None
+    normalized = str(action).strip().lower()
+    if normalized in ("brake", "stop", "yield", "emergency_brake", "emergencybrake"):
+      return "brake"
+    if normalized in ("left", "l_change", "left_change", "left_change_lane", "change_lane_left"):
+      return "left"
+    if normalized in ("right", "r_change", "right_change", "right_change_lane", "change_lane_right"):
+      return "right"
+    return None
 
 
 class OraclePolicy(ActivationPolicy):
@@ -746,12 +748,7 @@ class PDMOraclePolicy(OraclePolicy):
 def policy_from_env(vlm_enabled: bool = False) -> ActivationPolicy:
   if vlm_enabled:
     return VLMPolicy(
-        alpha_max=float(os.environ.get("VLM_ALPHA_MAX", os.environ.get("ACTIVATION_ALPHA_MAX", 1.0))),
-        mapping=os.environ.get("VLM_ALPHA_MAPPING", "linear"),
-        deadzone=float(os.environ.get("VLM_ALPHA_DEADZONE", 0.0)),
-        gamma=float(os.environ.get("VLM_ALPHA_GAMMA", 1.0)),
-        points=os.environ.get("VLM_ALPHA_POINTS", None),
-        decay_frames=int(os.environ.get("VLM_DECAY_FRAMES", 10)),
+        ttl_frames=int(os.environ.get("VLM_DECISION_TTL_FRAMES", os.environ.get("VLM_DECAY_FRAMES", 10))),
     )
 
   policy_name = os.environ.get("ACTIVATION_POLICY", os.environ.get("STEERING_POLICY", "")).lower()

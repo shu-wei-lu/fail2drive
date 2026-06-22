@@ -6,6 +6,7 @@ import argparse
 from tqdm import tqdm
 import random
 import shutil
+import shlex
 
 FAIL2DRIVE_JOB_PREFIX = "Fail2Drive_"
 MAX_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_num_jobs.txt")
@@ -28,18 +29,34 @@ def bash_file(job, cfg, carla_world_port_start, carla_streaming_port_start, carl
     log_file = job["log_file"]
     err_file = job["err_file"]
     job_file = job["job_file"]
+    carla_render_args = (
+        "-RenderOffScreen -graphicsadapter=0"
+        if cfg["rgb"]
+        else "-nullrhi"
+    )
+    carla_command = (
+        f"apptainer exec --nv "
+        f"--bind {shlex.quote(cfg['carla_bind_source'])}:/workspace "
+        f"{shlex.quote(cfg['carla_image'])} "
+        f"/workspace/f2d_carla/CarlaUE4.sh "
+        f"-carla-rpc-port=${{FREE_WORLD_PORT}} "
+        f"-nosound {carla_render_args} "
+        f"-carla-primary-port=0 "
+        f"-carla-streaming-port=${{FREE_STREAMING_PORT}}"
+    )
     with open(job_file, 'w', encoding='utf-8') as rsh:
             rsh.write(f'''#!/bin/bash
 #SBATCH --job-name=Fail2Drive_{seed}_{route_id}
-#SBATCH --partition=day
+#SBATCH --partition=devq
+#SBATCH --qos=normal
 #SBATCH -o {log_file}
 #SBATCH -e {err_file}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=6
-#SBATCH --mem=50gb
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16gb
 #SBATCH --time=8:00:00
-#SBATCH --gres=gpu:1080ti:1
+#SBATCH --gres=gpu:nvidia_geforce_rtx_4090:1
 # NOTE: Partition and gres likely need to be updated for your cluster
 
 # NOTE: Make sure that the time limit is enough for your model to fail the route!
@@ -59,16 +76,27 @@ echo 'Streaming Port:' $FREE_STREAMING_PORT
 export TM_PORT=`comm -23 <(seq {carla_tm_port_start} {carla_tm_port_start+49} | sort) <(ss -Htan | awk '{{print $4}}' | cut -d':' -f2 | sort -u) | shuf | head -n 1`
 echo 'TM Port:' $TM_PORT
 
-# NOTE: Changing -graphicsadapter=0 can be useful on multi-gpu systems
-{'${CARLA_ROOT}/CarlaUE4.sh -carla-rpc-port=${FREE_WORLD_PORT} -nosound -RenderOffScreen -carla-primary-port=0 -graphicsadapter=0 -carla-streaming-port=${FREE_STREAMING_PORT} &' if cfg["rgb"] else
- '${CARLA_ROOT}/CarlaUE4.sh -carla-rpc-port=${FREE_WORLD_PORT} -nosound -nullrhi -carla-primary-port=0 -carla-streaming-port=${FREE_STREAMING_PORT} &'}
+# Start CARLA inside the Apptainer image and clean it up when the job exits.
+{carla_command} &
+CARLA_PID=$!
+cleanup() {{
+    kill "$CARLA_PID" 2>/dev/null || true
+    wait "$CARLA_PID" 2>/dev/null || true
+}}
+trap cleanup EXIT INT TERM
+
 sleep 60  # Wait for CARLA to finish starting
+if ! kill -0 "$CARLA_PID" 2>/dev/null; then
+    echo "CARLA exited before the evaluator started" >&2
+    wait "$CARLA_PID"
+    exit 1
+fi
 
 # NOTE: --track=MAP may have to be changed according to agent track
 python -u {cfg["lb_script"]} \
 --routes={route} \
 --repetitions=1 \
---track=MAP \
+--track=SENSORS \
 --checkpoint={result_file} \
 --timeout=300 \
 --agent={cfg["agent_file"]} \
@@ -206,8 +234,23 @@ if __name__ == "__main__":
                       help='Disable RGB rendering and run with nullrhi')
     parser.add_argument('--no_viz', action='store_true',
                       help='Disable VIZ_PATH output directory handling')
+    parser.add_argument('--carla_image', type=str,
+                      default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "..", "carla-wrapper-native.sif"),
+                      help='Path to the Apptainer image containing CARLA')
+    parser.add_argument('--carla_bind_source', type=str,
+                      default=os.path.dirname(os.path.abspath(__file__)),
+                      help='Host fail2drive directory to bind to /workspace')
 
     args = parser.parse_args()
+
+    args.carla_image = os.path.abspath(os.path.expanduser(args.carla_image))
+    args.carla_bind_source = os.path.abspath(os.path.expanduser(args.carla_bind_source))
+    if not os.path.isfile(args.carla_image):
+        parser.error(f"CARLA Apptainer image not found: {args.carla_image}")
+    carla_script = os.path.join(args.carla_bind_source, "f2d_carla", "CarlaUE4.sh")
+    if not os.path.isfile(carla_script):
+        parser.error(f"CARLA launch script not found: {carla_script}")
 
     routes = sorted([x for x in os.listdir(args.routes) if x[-4:]==".xml"])
 
@@ -223,6 +266,8 @@ if __name__ == "__main__":
         "agent_config": args.agent_config,
         "rgb": not args.no_rgb, # NOTE: If RGB is disabled here and the agent uses a camera, CARLA will crash
         "viz": not args.no_viz,
+        "carla_image": args.carla_image,
+        "carla_bind_source": args.carla_bind_source,
     }
 
     # Filling the job queue

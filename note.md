@@ -6,11 +6,11 @@ python leaderboard/leaderboard/leaderboard_evaluator_local.py \
   --routes ./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml
 
 # Running the TransFuser++ model
-LIVE_VISU=1 \
+LIVE_VISU=0 \
 SAVE_PATH=./viz_vehicle \
 DEBUG_CHALLENGE=1 \
 python leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --routes ./fail2drive_split/Generalization_VehicleOnRoad_1085.xml \
+  --routes ./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml \
   --agent ./team_code/sensor_agent.py \
   --agent-config ./checkpoints/tfpp
 
@@ -124,3 +124,5 @@ python -u slurm_evaluate.py \
   --agent_file team_code/sensor_agent.py \
   --agent_config checkpoints/tfpp \
   --lb_script leaderboard/leaderboard/leaderboard_evaluator_local.py
+
+python -u leaderboard/leaderboard/leaderboard_evaluator_local.py   --routes ./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml   --repetitions=1   --track=SENSORS   --checkpoint ./results/alpamayo_vlm_test/local/simulation_results.json   --debug-checkpoint ./results/alpamayo_vlm_test/local/live_results.txt   --timeout=300   --agent ./team_code/sensor_agent.py   --agent-config ./checkpoints/tfpp   --port 2000   --traffic-manager-port 8000   --traffic-manager-seed=1

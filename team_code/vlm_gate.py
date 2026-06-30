@@ -39,9 +39,14 @@ class VLMDecision:
 class _VLMRequest:
   frame_id: int
   rgb_image: np.ndarray
+  rgb_images: list[np.ndarray]
+  image_frame_ids: list[int]
   speed: float
   command: int
   target_point: Optional[tuple[float, float]]
+  ego_history_xyz: Optional[list]
+  ego_history_rot: Optional[list]
+  submitted_at: float
 
 
 class AsyncVLMGate:
@@ -76,10 +81,20 @@ class AsyncVLMGate:
     self.binary_threshold = float(binary_threshold)
     self.confidence_threshold = float(confidence_threshold)
     self.server_url = server_url
+    self.timing = str(os.environ.get("VLM_TIMING", "0")).lower() in ("1", "true", "yes", "y")
     if self.save_inputs:
       self.input_save_dir.mkdir(parents=True, exist_ok=True)
 
     self._requests: queue.Queue[_VLMRequest] = queue.Queue(maxsize=1)
+    self._submit_lock = threading.Lock()
+    self._frame_buffer: list[tuple[int, np.ndarray]] = []
+    self._image_frame_offsets = self._parse_frame_offsets(
+        os.environ.get("VLM_SERVER_FRAME_OFFSETS", "-6,-4,-2,0"))
+    self._image_frame_buffer_size = max(
+        max(abs(offset) for offset in self._image_frame_offsets) + 4,
+        int(os.environ.get("VLM_SERVER_FRAME_BUFFER_SIZE", "12")))
+    self._request_inflight = False
+    self._last_request_frame_id: Optional[int] = None
     self._latest_lock = threading.Lock()
     self._latest: Optional[VLMDecision] = None
     self._stop_event = threading.Event()
@@ -126,21 +141,41 @@ class AsyncVLMGate:
     self._thread = threading.Thread(target=self._worker_loop, name="AsyncVLMGate", daemon=True)
     self._thread.start()
 
-  def submit(self, frame_id, rgb_image, speed, command, target_point=None):
-    if frame_id % self.every_n != 0:
-      return
+  def observe(self, frame_id, rgb_image):
+    current_image = np.asarray(rgb_image).copy()
+    with self._submit_lock:
+      self._append_frame_to_buffer(int(frame_id), current_image)
 
+  def submit(self, frame_id, rgb_image, speed, command, target_point=None,
+             ego_history_xyz=None, ego_history_rot=None):
+    submit_start = time.perf_counter()
     if isinstance(target_point, torch.Tensor):
       target_point = target_point.detach().flatten()[:2].cpu().numpy()
     if target_point is not None:
       target_point = tuple(float(x) for x in np.asarray(target_point).flatten()[:2])
 
+    current_image = np.asarray(rgb_image).copy()
+    with self._submit_lock:
+      self._append_frame_to_buffer(int(frame_id), current_image)
+      if not self._can_submit_request(int(frame_id)):
+        return
+      selected_frame_ids, selected_images = self._select_buffer_frames(
+          int(frame_id),
+          self._image_frame_offsets)
+      self._request_inflight = True
+      self._last_request_frame_id = int(frame_id)
+
     request = _VLMRequest(
         frame_id=int(frame_id),
-        rgb_image=np.asarray(rgb_image).copy(),
+        rgb_image=current_image,
+        rgb_images=selected_images,
+        image_frame_ids=selected_frame_ids,
         speed=float(speed),
         command=int(command),
-        target_point=target_point)
+        target_point=target_point,
+        ego_history_xyz=ego_history_xyz,
+        ego_history_rot=ego_history_rot,
+        submitted_at=time.time())
 
     # if self.verbose:
     #   print(
@@ -158,7 +193,13 @@ class AsyncVLMGate:
       try:
         self._requests.put_nowait(request)
       except queue.Full:
-        pass
+        self._mark_request_complete()
+        return
+    if self.timing:
+      print(
+          f"[VLMGateTiming] submit frame={request.frame_id} "
+          f"elapsed_ms={(time.perf_counter() - submit_start) * 1000.0:.2f}",
+          flush=True)
 
   def latest(self) -> Optional[VLMDecision]:
     with self._latest_lock:
@@ -192,8 +233,11 @@ class AsyncVLMGate:
         continue
 
       try:
+        inference_start = time.perf_counter()
         decision = self._run_inference(request)
+        inference_ms = (time.perf_counter() - inference_start) * 1000.0
       except Exception as exc:
+        inference_ms = (time.perf_counter() - inference_start) * 1000.0 if "inference_start" in locals() else 0.0
         decision = VLMDecision(
             frame_id=request.frame_id,
             enable_steering=False,
@@ -205,13 +249,20 @@ class AsyncVLMGate:
         print(f"AsyncVLMGate inference failed:\n{traceback.format_exc()}", flush=True)
 
       self._set_latest(decision)
+      if self.timing:
+        print(
+            f"[VLMGateTiming] result frame={decision.frame_id} "
+            f"inference_ms={inference_ms:.2f} "
+            f"age_ms={(time.time() - request.submitted_at) * 1000.0:.2f}",
+            flush=True)
       if self.verbose:
         raw_response = decision.raw_response.replace("\n", " ")[:500]
         print(
-            f"[VLMGate] result frame={decision.frame_id} alpha={decision.steering_alpha:.3f} "
-            f"action={decision.action} enable={decision.enable_steering} reason={decision.reason} "
+            f"[VLMGate] result frame={decision.frame_id} "
+            f"action={decision.action} reason={decision.reason} "
             f"error={decision.error} raw={raw_response}",
             flush=True)
+      self._mark_request_complete()
 
   def _load_model(self):
     if self.backend == "alpamayo_server":
@@ -321,10 +372,15 @@ class AsyncVLMGate:
 
   def _run_inference(self, request: _VLMRequest) -> VLMDecision:
     image = self._to_pil_image(request.rgb_image)
+    images = [self._to_pil_image(rgb_image) for rgb_image in request.rgb_images]
+    if not images:
+      images = [image]
+    if str(os.environ.get("VLM_SERVER_TWO_FRAMES", "1")).lower() in ("0", "false", "no", "n"):
+      images = [image]
     prompt = self._format_prompt(request)
     self._save_input_image(image, request, prompt)
     if self.backend == "alpamayo_server":
-      return self._run_alpamayo_server_inference(image, prompt, request)
+      return self._run_alpamayo_server_inference(images, prompt, request)
     if self.backend == "alpamayo":
       return self._run_alpamayo_inference(image, prompt, request.frame_id)
     if self.backend == "internvl":
@@ -360,14 +416,18 @@ class AsyncVLMGate:
     decision.timestamp = time.time()
     return decision
 
-  def _run_alpamayo_server_inference(self, image: Image.Image, prompt: str, request: _VLMRequest) -> VLMDecision:
+  def _run_alpamayo_server_inference(self, images: list[Image.Image], prompt: str, request: _VLMRequest) -> VLMDecision:
     payload = {
         "frame_id": request.frame_id,
-        "image_base64": self._image_to_base64_png(image),
+        "image_base64": self._image_to_base64_png(images[-1]),
+        "images_base64": [self._image_to_base64_png(image) for image in images],
+        "image_frame_ids": request.image_frame_ids if len(images) == len(request.image_frame_ids) else [request.frame_id],
         "prompt": prompt,
         "speed": request.speed,
         "command": request.command,
         "target_point": request.target_point,
+        "ego_history_xyz": request.ego_history_xyz,
+        "ego_history_rot": request.ego_history_rot,
         "max_new_tokens": self.max_new_tokens,
     }
     body = json.dumps(payload).encode("utf-8")
@@ -399,6 +459,55 @@ class AsyncVLMGate:
     decision.raw_response = raw_response or json.dumps(response_data)
     decision.timestamp = time.time()
     return decision
+
+  @staticmethod
+  def _parse_frame_offsets(spec: str) -> list[int]:
+    offsets = []
+    for item in str(spec).split(","):
+      item = item.strip()
+      if not item:
+        continue
+      offsets.append(int(item))
+    if not offsets:
+      return [-6, -4, -2, 0]
+    return sorted(set(offsets))
+
+  def _append_frame_to_buffer(self, frame_id: int, image: np.ndarray):
+    if self._frame_buffer and self._frame_buffer[-1][0] == frame_id:
+      self._frame_buffer[-1] = (frame_id, image.copy())
+    else:
+      self._frame_buffer.append((frame_id, image.copy()))
+    if len(self._frame_buffer) > self._image_frame_buffer_size:
+      self._frame_buffer = self._frame_buffer[-self._image_frame_buffer_size:]
+
+  def _can_submit_request(self, frame_id: int) -> bool:
+    if self._request_inflight:
+      return False
+    if self._last_request_frame_id is None:
+      return True
+    return frame_id - self._last_request_frame_id >= self.every_n
+
+  def _mark_request_complete(self):
+    with self._submit_lock:
+      self._request_inflight = False
+
+  def _select_buffer_frames(self, frame_id: int, offsets: list[int]) -> tuple[list[int], list[np.ndarray]]:
+    selected_frame_ids = []
+    selected_images = []
+    for offset in offsets:
+      target_frame = frame_id + int(offset)
+      selected_frame_id, selected_image = self._nearest_buffer_frame(target_frame)
+      selected_frame_ids.append(selected_frame_id)
+      selected_images.append(selected_image.copy())
+    return selected_frame_ids, selected_images
+
+  def _nearest_buffer_frame(self, target_frame: int) -> tuple[int, np.ndarray]:
+    if not self._frame_buffer:
+      raise RuntimeError("VLM frame buffer is empty")
+    past_or_current = [item for item in self._frame_buffer if item[0] <= target_frame]
+    if past_or_current:
+      return max(past_or_current, key=lambda item: item[0])
+    return min(self._frame_buffer, key=lambda item: item[0])
 
   @staticmethod
   def _image_to_base64_png(image: Image.Image) -> str:
@@ -456,7 +565,7 @@ class AsyncVLMGate:
           **inputs)
 
     sequences = self._alpamayo_replace_padding_after_eos(
-        token_ids=outputs.sequences,
+        token_ids=outputs.sequences.clone(),
         eos_token_id=eos_token_id,
         pad_token_id=self._tokenizer.pad_token_id)
     generated_ids = sequences[:, input_ids.shape[1]:]
@@ -493,16 +602,15 @@ class AsyncVLMGate:
     )
     text = (
         f"{hist_traj_placeholder}{prompt}\n"
-        "Return the final decision as strict JSON with one action field: "
-        "{\"action\":\"none|brake|left|right\",\"reason\":\"...\"}. "
-        "Use left for a left lane-change intervention and right for a right lane-change intervention."
+        "Return final answer as strict JSON only: "
+        "{\"action\":\"none|brake|left|right\",\"reason\":\"...\"}."
     )
     return [
         {
             "role": "system",
             "content": [{
                 "type": "text",
-                "text": "You are a driving assistant that chooses safe activation-steering interventions.",
+                "text": "You are a driving assistant that generates safe and accurate actions.",
             }],
         },
         {
@@ -834,7 +942,13 @@ class AsyncVLMGate:
         "reason"):
       value = data.get(key, "")
       if value is not None and str(value).strip():
-        parts.append(f"{key}: {str(value).strip()}")
+        cleaned = re.sub(r"<\|[^|]+?\|>", "", str(value)).strip()
+        if not cleaned:
+          continue
+        if key == "reason":
+          parts.append(cleaned)
+        else:
+          parts.append(f"{key}: {cleaned}")
     return " | ".join(parts)[:240]
 
   @staticmethod
@@ -1028,23 +1142,17 @@ class AsyncVLMGate:
   @staticmethod
   def _default_prompt() -> str:
     return """
-Role: Autonomous Driving Commander. Speed: {CURRENT_SPEED} km/h. Intent: {NAV_COMMAND}.
-Task: Output the safest activation-steering intervention. Do NOT use full sentences.
-Image input:
-- First image is previous frame, second image is current frame.
-- {TEMPORAL_CONTEXT}
-- Compare current frame - previous decision frame to infer motion and newly appearing hazards.
-- Use temporal change only to infer whether hazards are moving into, staying in, or clearing the ego path.
-
-Output strictly valid JSON.
-{
-  "ego_lane_blocked": true/false,
-  "blocking_object": "...",
-  "object_position": "ego_lane / left_lane / right_lane / shoulder / unknown",
-  "distance": "near / mid / far",
-  "left_lane_clear": true/false/unknown,
-  "right_lane_clear": true/false/unknown,
-  "action": "<EXACTLY ONE: none, brake, left, right>",
-  "reason": "..."
-}
 """
+# Context:
+# # - Current speed: {CURRENT_SPEED} km/h.
+# # - Navigation intent: {NAV_COMMAND}.
+# # - Ego-frame target point: {target_point}.
+# # - Current frame: {CURRENT_FRAME}; previous decision frame: {PREVIOUS_DECISION_FRAME}; frame delta: {FRAME_DELTA}.
+# # - {TEMPORAL_CONTEXT}
+
+# Safety policy:
+# - Identify hazards blocking the ego lane or intended path.
+# - Consider whether obstacles are moving into, staying in, or clearing the ego path.
+# - Use LEFT or RIGHT only if that side has clearly safer free space.
+# - Prefer BRAKE over lateral steering when lane clearance is uncertain.
+# - Prefer NONE when there is no immediate hazard.

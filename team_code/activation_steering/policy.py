@@ -92,7 +92,7 @@ class VLMPolicy(ActivationPolicy):
     if getattr(vlm_decision, "steering_alpha", 0.0) <= 0.0 and not getattr(vlm_decision, "enable_steering", False):
       return alpha_vector
 
-    alpha_vector[self.ACTION_INDEX[action]] = 1.0
+    alpha_vector[self.ACTION_INDEX[action]] = 2.0 if action == "brake" else 1.0
     return alpha_vector
 
   @classmethod

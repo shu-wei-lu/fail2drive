@@ -256,29 +256,22 @@ def wait_for_free_ports(args: argparse.Namespace) -> None:
         time.sleep(1.0)
 
 
-def start_carla(args: argparse.Namespace, log_file: Path) -> subprocess.Popen:
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+def start_carla(args: argparse.Namespace) -> subprocess.Popen:
     wait_for_free_ports(args)
     command = carla_command(args)
-    log = log_file.open("a", encoding="utf-8")
-    log.write(f"\n[local_evaluate] starting CARLA: {tee_command(command)}\n")
-    log.flush()
     process = subprocess.Popen(
         command,
-        stdout=log,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    process._local_evaluate_log = log  # type: ignore[attr-defined]
     time.sleep(args.carla_startup_wait)
     if process.poll() is not None:
-        log.close()
         raise RuntimeError(f"CARLA exited during startup with code {process.returncode}")
     return process
 
 
 def stop_carla(process: subprocess.Popen, args: argparse.Namespace, timeout: float = 20.0) -> None:
-    log = getattr(process, "_local_evaluate_log", None)
     if process.poll() is None:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -302,11 +295,7 @@ def stop_carla(process: subprocess.Popen, args: argparse.Namespace, timeout: flo
     try:
         wait_for_free_ports(args)
     except RuntimeError as exc:
-        if log is not None:
-            log.write(f"[local_evaluate] warning after stopping CARLA: {exc}\n")
-    if log is not None:
-        log.write(f"[local_evaluate] stopped CARLA returncode={process.returncode}\n")
-        log.close()
+        print(f"[warn] after stopping CARLA: {exc}")
 
 
 def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) -> int:
@@ -400,13 +389,7 @@ def main() -> int:
                 return_code = 1
                 try:
                     if args.restart_carla:
-                        carla_log = (
-                            Path(args.out_root)
-                            / str(seed)
-                            / "out"
-                            / f"{route_id}_carla_attempt{attempt}.log"
-                        )
-                        carla_process = start_carla(args, carla_log)
+                        carla_process = start_carla(args)
                     return_code = run_route(args, route, seed, attempt)
                 except RuntimeError as exc:
                     print(f"[warn] CARLA failed to start for seed={seed} route={route.name}: {exc}")

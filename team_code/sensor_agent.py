@@ -30,6 +30,7 @@ from scipy.optimize import fsolve
 from scenario_logger import ScenarioLogger
 import transfuser_utils as t_u
 from vlm_gate import AsyncVLMGate
+from depth_ttc_gate import DepthTTCClient
 from activation_steering.policy import policy_from_env
 
 import pathlib
@@ -102,11 +103,21 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.stop_after_meter = int(os.environ.get('STOP_AFTER_METER', -1))
     print('STOP_AFTER_METER: ', self.stop_after_meter)
     self.vlm_steering = strtobool(os.environ.get('VLM_STEERING', 'False'))
+    self.depth_ttc_steering = self._depth_ttc_enabled_from_env()
     self.vlm_gate = None
+    self.depth_ttc_client = None
+    self.depth_ttc_last_decision = None
+    self.depth_ttc_every_n = max(1, int(os.environ.get('DEPTH_TTC_EVERY_N', 1)))
+    self.depth_ttc_hold_frames = max(1, int(os.environ.get('DEPTH_TTC_HOLD_FRAMES', 1)))
+    self.depth_ttc_last_score_frame = None
+    self.depth_ttc_active_until = -1
+    self.depth_ttc_active_candidate = 'original'
     self.vlm_last_decision = None
     self.vlm_last_decision_key = None
     self.vlm_decision_start_frame = None
-    self.activation_policy = policy_from_env(vlm_enabled=self.vlm_steering)
+    self.vlm_history_steps = int(os.environ.get('VLM_ALPAMAYO_HISTORY_STEPS', 16))
+    self.vlm_history_stride = int(os.environ.get('VLM_ALPAMAYO_HISTORY_STRIDE_FRAMES', 2))
+    self.activation_policy = policy_from_env(vlm_enabled=self.vlm_steering and not self.depth_ttc_steering)
     print('Steering Policy: ', self.activation_policy.__class__.__name__)
 
     # If set to true, will generate visualizations at SAVE_PATH
@@ -161,7 +172,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
         self.nets.append(net)
 
-    if self.vlm_steering:
+    if self.depth_ttc_steering:
+      self.depth_ttc_client = DepthTTCClient.from_env()
+      print(
+          f'Depth TTC steering enabled: {self.depth_ttc_client.server_url} '
+          f'horizon_s={self.depth_ttc_client.horizon_s} '
+          f'every_n={self.depth_ttc_every_n} hold_frames={self.depth_ttc_hold_frames}')
+
+    if self.vlm_steering and not self.depth_ttc_steering:
       self.vlm_gate = AsyncVLMGate.from_env()
       self.vlm_gate.start()
 
@@ -199,6 +217,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.filter_initialized = False
     # Stores the last filtered positions of the ego vehicle. Need at least 2 for LiDAR 10 Hz realignment
     self.state_log = deque(maxlen=max((self.config.lidar_seq_len * self.config.data_save_freq), 2))
+    self.vlm_state_log = deque(maxlen=max((self.vlm_history_steps * self.vlm_history_stride) + 1, 2))
 
     #Temporal LiDAR
     self.lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq)
@@ -412,6 +431,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.ukf.update(np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed]))
     filtered_state = self.ukf.x
     self.state_log.append(filtered_state)
+    self.vlm_state_log.append(filtered_state.copy())
     result['gps'] = filtered_state[0:2]
 
     waypoint_route = self._route_planner.run_step(np.append(filtered_state[0:2], gps_pos[2]))
@@ -571,89 +591,168 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           print(
               f"[VLMGate] use step={self.step} decision_frame={self.vlm_last_decision.frame_id} "
               f"age={decision_age_frames} action={getattr(self.vlm_last_decision, 'action', 'none')} "
-              f"alpha={self._format_activation_alpha(steering_alpha)} reason={self.vlm_last_decision.reason}",
+              f"reason={self.vlm_last_decision.reason}",
               flush=True)
       elif self.vlm_gate.verbose:
-        print(f"[VLMGate] use step={self.step} no completed decision yet; alpha=0.000", flush=True)
+        print(f"[VLMGate] use step={self.step} no completed decision yet", flush=True)
     else:
       steering_alpha = self.activation_policy.alpha(self.step)
 
     # forward pass
-    pred_wps = []
-    pred_target_speeds = []
-    pred_checkpoints = []
-    bounding_boxes = []
-    wp_selected = None
     feature_frame_idx = self.step
-    for i in range(self.model_count):
-      if self.config.backbone in ('transFuser', 'aim', 'bev_encoder'):
-        model_output = self.nets[i].forward(
-          rgb=tick_data['rgb'],
-          lidar_bev=lidar_bev,
-          target_point=tick_data['target_point'],
-          target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
-          ego_vel=velocity,
-          command=tick_data['command'],
-          steering_alpha=steering_alpha,
-          return_fused_features=self.save_fused_features)
-        if self.save_fused_features:
-          pred_wp, \
-          pred_target_speed, \
-          pred_checkpoint, \
-          pred_semantic, \
-          pred_bev_semantic, \
-          pred_depth, \
-          pred_bb_features,\
-          attention_weights,\
-          pred_wp_1,\
-          selected_path, \
-          fused_features = model_output
-          self._save_fused_features(fused_features, i, feature_frame_idx)
-        else:
-          pred_wp, \
-          pred_target_speed, \
-          pred_checkpoint, \
-          pred_semantic, \
-          pred_bev_semantic, \
-          pred_depth, \
-          pred_bb_features,\
-          attention_weights,\
-          pred_wp_1,\
-          selected_path = model_output
-        # Only convert bounding boxes when they are used.
-        if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
-                                         self.stop_sign_controller):
-          pred_bounding_box = self.nets[i].convert_features_to_bb_metric(pred_bb_features)
-        else:
-          pred_bounding_box = None
+    forward_candidates = [('original', steering_alpha)]
+    depth_ttc_should_score = False
+    if self.depth_ttc_client is not None:
+      depth_ttc_should_score = self._depth_ttc_should_score(speed)
+      if depth_ttc_should_score:
+        forward_candidates = self._depth_ttc_candidate_alphas()
       else:
-        raise ValueError('The chosen vision backbone does not exist. The options are: transFuser, aim, bev_encoder')
+        held_candidate = self._depth_ttc_held_candidate()
+        forward_candidates = [(held_candidate, self._depth_ttc_alpha_for_candidate(held_candidate))]
 
-      if self.config.use_wp_gru:
-        if self.config.multi_wp_output:
-          wp_selected = 0
-          if F.sigmoid(selected_path)[0].item() > 0.5:
-            wp_selected = 1
-            pred_wps.append(pred_wp_1)
+    candidate_results = {}
+    for candidate_name, candidate_alpha in forward_candidates:
+      pred_wps = []
+      pred_target_speeds = []
+      pred_checkpoints = []
+      bounding_boxes = []
+      wp_selected = None
+      for i in range(self.model_count):
+        if self.config.backbone in ('transFuser', 'aim', 'bev_encoder'):
+          model_output = self.nets[i].forward(
+            rgb=tick_data['rgb'],
+            lidar_bev=lidar_bev,
+            target_point=tick_data['target_point'],
+            target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
+            ego_vel=velocity,
+            command=tick_data['command'],
+            steering_alpha=candidate_alpha,
+            return_fused_features=self.save_fused_features and candidate_name == 'original')
+          if self.save_fused_features and candidate_name == 'original':
+            pred_wp, \
+            pred_target_speed, \
+            pred_checkpoint, \
+            pred_semantic, \
+            pred_bev_semantic, \
+            pred_depth, \
+            pred_bb_features,\
+            attention_weights,\
+            pred_wp_1,\
+            selected_path, \
+            fused_features = model_output
+            self._save_fused_features(fused_features, i, feature_frame_idx)
+          else:
+            pred_wp, \
+            pred_target_speed, \
+            pred_checkpoint, \
+            pred_semantic, \
+            pred_bev_semantic, \
+            pred_depth, \
+            pred_bb_features,\
+            attention_weights,\
+            pred_wp_1,\
+            selected_path = model_output
+          # Only convert bounding boxes when they are used.
+          if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
+                                           self.stop_sign_controller):
+            pred_bounding_box = self.nets[i].convert_features_to_bb_metric(pred_bb_features)
+          else:
+            pred_bounding_box = None
+        else:
+          raise ValueError('The chosen vision backbone does not exist. The options are: transFuser, aim, bev_encoder')
+
+        if self.config.use_wp_gru:
+          if self.config.multi_wp_output:
+            wp_selected = 0
+            if F.sigmoid(selected_path)[0].item() > 0.5:
+              wp_selected = 1
+              pred_wps.append(pred_wp_1)
+            else:
+              pred_wps.append(pred_wp)
           else:
             pred_wps.append(pred_wp)
-        else:
-          pred_wps.append(pred_wp)
-      if self.config.use_controller_input_prediction:
-        pred_target_speeds.append(F.softmax(pred_target_speed[0], dim=0))
-        pred_checkpoints.append(pred_checkpoint[0])
+        if self.config.use_controller_input_prediction:
+          pred_target_speeds.append(F.softmax(pred_target_speed[0], dim=0))
+          pred_checkpoints.append(pred_checkpoint[0])
 
-      bounding_boxes.append(pred_bounding_box)
+        bounding_boxes.append(pred_bounding_box)
 
-    # Average the predictions from ensembles
+      pred_wp_ensemble = torch.stack(pred_wps, dim=0).mean(dim=0) if pred_wps else None
+      pred_checkpoint_ensemble = torch.stack(pred_checkpoints, dim=0).mean(dim=0) if pred_checkpoints else None
+      pred_target_speed_ensemble = torch.stack(pred_target_speeds, dim=0).mean(dim=0) if pred_target_speeds else None
+      if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
+                                       self.stop_sign_controller):
+        bbs_vehicle_coordinate_system = t_u.non_maximum_suppression(bounding_boxes, self.config.iou_treshold_nms)
+      else:
+        bbs_vehicle_coordinate_system = None
+
+      candidate_results[candidate_name] = {
+          'steering_alpha': candidate_alpha,
+          'pred_wps': pred_wps,
+          'pred_target_speeds': pred_target_speeds,
+          'pred_checkpoints': pred_checkpoints,
+          'pred_wp_ensemble': pred_wp_ensemble,
+          'pred_checkpoint_ensemble': pred_checkpoint_ensemble,
+          'pred_target_speed_ensemble': pred_target_speed_ensemble,
+          'bbs_vehicle_coordinate_system': bbs_vehicle_coordinate_system,
+          'wp_selected': wp_selected,
+          'pred_wp': pred_wp,
+          'pred_target_speed': pred_target_speed,
+          'pred_checkpoint': pred_checkpoint,
+          'pred_semantic': pred_semantic,
+          'pred_bev_semantic': pred_bev_semantic,
+          'pred_depth': pred_depth,
+          'attention_weights': attention_weights,
+          'pred_wp_1': pred_wp_1,
+      }
+
+    selected_candidate = forward_candidates[0][0]
+    if self.depth_ttc_client is not None and depth_ttc_should_score and len(candidate_results) > 1:
+      planner_candidates = self._depth_ttc_planner_candidates_from_results(candidate_results)
+      if planner_candidates:
+        self.depth_ttc_last_score_frame = self.step
+        self.depth_ttc_last_decision = self.depth_ttc_client.score(
+            frame_id=self.step,
+            rgb_image=tick_data['rgb_front_np'],
+            speed=speed,
+            camera=self._depth_ttc_camera_payload(tick_data['rgb_front_np']),
+            ego_extent={'x': float(self.config.ego_extent_x), 'y': float(self.config.ego_extent_y)},
+            planner_candidates={
+                'candidates': planner_candidates,
+                'target_speeds': [float(value) for value in self.inference_target_speeds],
+                'uncertainty_weight': int(self.uncertainty_weight),
+                'brake_uncertainty_threshold': float(self.config.brake_uncertainty_threshold),
+            })
+        selected_candidate = getattr(self.depth_ttc_last_decision, 'selected_trajectory', 'original')
+        if selected_candidate not in candidate_results:
+          selected_candidate = 'original'
+        self._depth_ttc_activate_candidate(selected_candidate)
+        if self.depth_ttc_client.verbose:
+          print(
+              f"[DepthTTC] use step={self.step} selected={selected_candidate} "
+              f"action={getattr(self.depth_ttc_last_decision, 'action', 'none')} "
+              f"active_until={self.depth_ttc_active_until}",
+              flush=True)
+
+    selected_result = candidate_results[selected_candidate]
+    steering_alpha = selected_result['steering_alpha']
+    pred_wps = selected_result['pred_wps']
+    pred_target_speeds = selected_result['pred_target_speeds']
+    pred_checkpoints = selected_result['pred_checkpoints']
+    bbs_vehicle_coordinate_system = selected_result['bbs_vehicle_coordinate_system']
+    wp_selected = selected_result['wp_selected']
+    pred_wp = selected_result['pred_wp']
+    pred_target_speed = selected_result['pred_target_speed']
+    pred_checkpoint = selected_result['pred_checkpoint']
+    pred_semantic = selected_result['pred_semantic']
+    pred_bev_semantic = selected_result['pred_bev_semantic']
+    pred_depth = selected_result['pred_depth']
+    attention_weights = selected_result['attention_weights']
+    pred_wp_1 = selected_result['pred_wp_1']
+
     if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
                                      self.stop_sign_controller):
-      # We average bounding boxes by using non-maximum suppression on the set of all detected boxes.
-      bbs_vehicle_coordinate_system = t_u.non_maximum_suppression(bounding_boxes, self.config.iou_treshold_nms)
-
       self.bb_buffer.append(bbs_vehicle_coordinate_system)
-    else:
-      bbs_vehicle_coordinate_system = None
 
     stop_for_stop_sign = False
     if self.stop_sign_controller:
@@ -665,13 +764,17 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.config.use_wp_gru:
       self.pred_wp = torch.stack(pred_wps, dim=0).mean(dim=0)
 
-    if self.vlm_gate is not None and speed > 3.5:
-      self.vlm_gate.submit(
-          frame_id=self.step,
-          rgb_image=tick_data['rgb_front_np'],
-          speed=speed,
-          command=self.commands[-2],
-          target_point=tick_data['target_point'])
+    if self.vlm_gate is not None:
+      self.vlm_gate.observe(self.step, tick_data['rgb_front_np'])
+      if speed > 3.5:
+        self.vlm_gate.submit(
+            frame_id=self.step,
+            rgb_image=tick_data['rgb_front_np'],
+            speed=speed,
+            command=self.commands[-2],
+            target_point=tick_data['target_point'],
+            ego_history_xyz=self._vlm_ego_history_xyz(),
+            ego_history_rot=self._vlm_ego_history_rot())
 
     # calculate target speed scalar from model predictions
     if self.config.use_controller_input_prediction:
@@ -870,6 +973,157 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if t_s <= 3.0:
       return (255, 128, 0)
     return (255, 230, 0)
+
+  @staticmethod
+  def _depth_ttc_enabled_from_env():
+    policy_name = os.environ.get('ACTIVATION_POLICY', os.environ.get('STEERING_POLICY', '')).lower()
+    return (
+        strtobool(os.environ.get('DEPTH_TTC_STEERING', 'False')) or
+        policy_name in ('depth_ttc', 'depth-ttc', 'depthttc'))
+
+  @staticmethod
+  def _depth_ttc_candidate_alphas():
+    brake_alpha = float(os.environ.get('DEPTH_TTC_BRAKE_ALPHA', 3.0))
+    lateral_alpha = float(os.environ.get('DEPTH_TTC_LATERAL_ALPHA', 1.0))
+    return [
+        ('original', [0.0, 0.0, 0.0]),
+        ('brake', [brake_alpha, 0.0, 0.0]),
+        ('left', [0.0, lateral_alpha, 0.0]),
+        ('right', [0.0, 0.0, lateral_alpha]),
+    ]
+
+  def _depth_ttc_alpha_for_candidate(self, candidate):
+    candidate = str(candidate or 'original').lower()
+    for name, alpha in self._depth_ttc_candidate_alphas():
+      if candidate == name:
+        return alpha
+    return self._depth_ttc_candidate_alphas()[0][1]
+
+  def _depth_ttc_should_score(self, speed):
+    min_speed = float(os.environ.get('DEPTH_TTC_MIN_SPEED_M_S', 0.0))
+    if float(speed) < min_speed:
+      return False
+    if self.depth_ttc_last_score_frame is None:
+      return True
+    return (self.step - self.depth_ttc_last_score_frame) >= self.depth_ttc_every_n
+
+  def _depth_ttc_held_candidate(self):
+    if self.step <= self.depth_ttc_active_until:
+      candidate = str(self.depth_ttc_active_candidate or 'original').lower()
+      if candidate in ('brake', 'left', 'right'):
+        return candidate
+    return 'original'
+
+  def _depth_ttc_activate_candidate(self, candidate):
+    candidate = str(candidate or 'original').lower()
+    if candidate not in ('brake', 'left', 'right'):
+      self.depth_ttc_active_candidate = 'original'
+      self.depth_ttc_active_until = self.step
+      return
+    self.depth_ttc_active_candidate = candidate
+    self.depth_ttc_active_until = self.step + self.depth_ttc_hold_frames - 1
+
+  @staticmethod
+  def _depth_ttc_planner_candidates_from_results(candidate_results):
+    planner_candidates = {}
+    for name, result in candidate_results.items():
+      checkpoints = result.get('pred_checkpoint_ensemble')
+      target_speed_probs = result.get('pred_target_speed_ensemble')
+      if checkpoints is None or target_speed_probs is None:
+        continue
+      if hasattr(checkpoints, 'detach'):
+        checkpoints = checkpoints.detach().cpu().numpy()
+      if hasattr(target_speed_probs, 'detach'):
+        target_speed_probs = target_speed_probs.detach().cpu().numpy()
+      checkpoints = np.asarray(checkpoints, dtype=np.float32)
+      if checkpoints.ndim == 3:
+        checkpoints = checkpoints[0]
+      target_speed_probs = np.asarray(target_speed_probs, dtype=np.float32).reshape(-1)
+      if checkpoints.ndim != 2 or checkpoints.shape[1] < 2 or len(target_speed_probs) == 0:
+        continue
+      planner_candidates[name] = {
+          'checkpoints': checkpoints[:, :2].tolist(),
+          'target_speed_probs': target_speed_probs.tolist(),
+      }
+    return planner_candidates
+
+  def _depth_ttc_camera_payload(self, image):
+    image_height, image_width = np.asarray(image).shape[:2]
+    intrinsic = t_u.calculate_intrinsic_matrix(
+        fov=self.config.camera_fov,
+        height=self.config.camera_height,
+        width=self.config.camera_width)
+    base_width = self.config.camera_width
+    base_height = self.config.camera_height
+    if self.config.crop_image:
+      side_crop = (self.config.camera_width - self.config.cropped_width) // 2
+      intrinsic[0, 2] -= side_crop
+      base_width = self.config.cropped_width
+      base_height = self.config.cropped_height
+
+    scale_x = float(image_width) / float(base_width)
+    scale_y = float(image_height) / float(base_height)
+    return {
+        'fx': float(intrinsic[0, 0] * scale_x),
+        'fy': float(intrinsic[1, 1] * scale_y),
+        'cx': float(intrinsic[0, 2] * scale_x),
+        'cy': float(intrinsic[1, 2] * scale_y),
+        'fov': float(self.config.camera_fov),
+        'position': [float(value) for value in self.config.camera_pos],
+    }
+
+  def _vlm_ego_history_states(self):
+    history_log = getattr(self, 'vlm_state_log', self.state_log)
+    if len(history_log) == 0:
+      return None
+
+    states = list(history_log)
+    last_index = len(states) - 1
+    indices = [
+        max(0, last_index - self.vlm_history_stride * offset)
+        for offset in reversed(range(self.vlm_history_steps))
+    ]
+    return np.asarray([states[index][:3] for index in indices], dtype=np.float32)
+
+  @staticmethod
+  def _yaw_rotation_matrix(yaw):
+    c = math.cos(float(yaw))
+    s = math.sin(float(yaw))
+    return np.asarray([
+        [c, -s, 0.0],
+        [s, c, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+
+  def _vlm_ego_history_xyz(self):
+    states = self._vlm_ego_history_states()
+    if states is None:
+      return None
+
+    t0_xy = states[-1, :2].copy()
+    t0_yaw = float(states[-1, 2])
+    c = math.cos(t0_yaw)
+    s = math.sin(t0_yaw)
+    delta = states[:, :2] - t0_xy
+    local_xy = np.stack([
+        c * delta[:, 0] + s * delta[:, 1],
+        -s * delta[:, 0] + c * delta[:, 1],
+    ], axis=1)
+    xyz = np.zeros((self.vlm_history_steps, 3), dtype=np.float32)
+    xyz[:, :2] = local_xy.astype(np.float32)
+    return xyz.reshape(1, 1, self.vlm_history_steps, 3).tolist()
+
+  def _vlm_ego_history_rot(self):
+    states = self._vlm_ego_history_states()
+    if states is None:
+      return None
+
+    current_inv = self._yaw_rotation_matrix(float(states[-1, 2])).T
+    rotations = []
+    for yaw in states[:, 2]:
+      rotations.append(current_inv @ self._yaw_rotation_matrix(float(yaw)))
+    rot = np.stack(rotations, axis=0).astype(np.float32)
+    return rot.reshape(1, 1, self.vlm_history_steps, 3, 3).tolist()
 
   def _resample_vlm_trajectory_by_time(self, trajectory, speed):
     if trajectory is None:

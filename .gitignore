@@ -222,4 +222,6 @@ cython_debug/
 
 *.json
 *.xml
+!steering_split/
+!steering_split/**/*.xml
 *.zip

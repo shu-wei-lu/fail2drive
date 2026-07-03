@@ -10,11 +10,15 @@
     </waypoints>
     <scenarios>
       <scenario name="SteeringChangeLaneLeft" type="VehicleOnRoad">
-        <distance value="10" />
+        <distance value="30" />
         <stop_time value="20" />
         <vehicle value="vehicle.*" />
         <lateral_offset value="1.5" />
-        <trigger_point x="-556.7" y="4080.7" z="145.9" yaw="-16.5" />
+        <trigger_point x="-663.5" y="4112.3" z="145.8" yaw="-16.5" />
+      </scenario>
+      <scenario name="DisableOppositeTraffic" type="BackgroundActivityParametrizer">
+        <opposite_active value="0"/>
+        <trigger_point x="-663.5" y="4112.3" z="145.8" yaw="-16.5"/>
       </scenario>
     </scenarios>
   </route>

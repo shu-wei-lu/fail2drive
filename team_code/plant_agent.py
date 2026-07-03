@@ -4,6 +4,7 @@ Drives by accessing the simulator directly.
 """
 
 import os
+import pathlib
 import torch
 import torch.nn.functional as F
 from plant import PlanT
@@ -35,6 +36,11 @@ class PlanTAgent(DataAgent):
 
   def setup(self, path_to_conf_file, route_index=None, traffic_manager=None):
     super().setup(path_to_conf_file, route_index, traffic_manager)
+    self.visual_output_path = None
+    visual_output_root = os.environ.get('VISUAL_OUTPUT_PATH', None)
+    if visual_output_root is not None and route_index is not None:
+      self.visual_output_path = pathlib.Path(visual_output_root).resolve() / str(route_index)
+      self.visual_output_path.mkdir(parents=True, exist_ok=True)
 
     torch.cuda.empty_cache()
 
@@ -212,7 +218,8 @@ class PlanTAgent(DataAgent):
 
     # Visualize the output of the last model
     if self.config.debug and (not self.save_path is None):
-      self.nets[0].visualize_model(save_path=self.save_path,
+      visual_save_path = self.visual_output_path if self.visual_output_path is not None else self.save_path
+      self.nets[0].visualize_model(save_path=visual_save_path,
                                    step=self.step,
                                    rgb=torch.tensor(rgb_debug),
                                    target_point=tick_data['target_point'],

@@ -74,11 +74,6 @@ def parse_args() -> argparse.Namespace:
       help='Do not set STOP_CONTROL=0.',
   )
   parser.add_argument(
-      '--normalize',
-      action='store_true',
-      help='Normalize the activation vector.',
-  )
-  parser.add_argument(
       '--env',
       action='append',
       default=[],
@@ -216,7 +211,6 @@ def run_alpha(
       'SAVE_PATH': str(logs_dir),
       'STEERING_ALPHA': str(alpha),
       'START_STEERING_FRAME': str(args.start_steering_frame),
-      'NORMALIZE_STEERING_VECTOR': '1' if args.normalize else '0',
   })
   if args.activation_vector_path:
     env['ACTIVATION_VECTOR_PATH'] = str(args.activation_vector_path)

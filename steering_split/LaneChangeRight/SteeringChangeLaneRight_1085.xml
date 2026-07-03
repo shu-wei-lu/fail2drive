@@ -9,12 +9,13 @@
       <position x="-1109.7" y="5972.0" z="145.9" />
     </waypoints>
     <scenarios>
-      <scenario name="SteeringChangeLaneRight" type="VehicleOnRoad">
-        <distance value="30" />
-        <stop_time value="20" />
-        <vehicle value="vehicle.*" />
+      <scenario name="SteeringChangeLaneRight" type="StaticPropOnRoad">
+        <distance value="40" />
+        <stop_time value="30" />
+        <prop value="static.prop.trafficwarning" />
+        <yaw_offset value="-90" />
         <lateral_offset value="-1.5" />
-        <trigger_point x="-870.8" y="6012.5" z="147.4" yaw="-170.4" />
+        <trigger_point x="-792.2" y="6025.9" z="148.2" yaw="-170.4" />
       </scenario>
     </scenarios>
   </route>

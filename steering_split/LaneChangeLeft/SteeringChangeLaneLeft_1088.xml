@@ -16,6 +16,10 @@
         <lateral_offset value="1.5" />
         <trigger_point x="2837.6" y="5236.5" z="168.7" yaw="0.6" />
       </scenario>
+      <scenario name="DisableOppositeTraffic" type="BackgroundActivityParametrizer">
+        <opposite_active value="0"/>
+        <trigger_point x="2826.5" y="5236.4" z="168.4" yaw="0.6"/>
+      </scenario>
     </scenarios>
   </route>
 </routes>

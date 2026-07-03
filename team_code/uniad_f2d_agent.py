@@ -52,6 +52,7 @@ class Fail2DriveUniadAgent(Bench2DriveUniadAgent):
     def setup(self, path_to_conf_file, route_index=None, traffic_manager=None):
         self.route_index = route_index
         self.traffic_manager = traffic_manager
+        self.visual_save_path = None
         os.environ.setdefault("ROUTES", str(route_index or "fail2drive_uniad"))
         parts = path_to_conf_file.split("+")
         if len(parts) < 2:
@@ -73,6 +74,16 @@ class Fail2DriveUniadAgent(Bench2DriveUniadAgent):
                     (self.save_path / folder).rmdir()
                 except OSError:
                     pass
+        self._configure_visual_output_path()
+
+    def _configure_visual_output_path(self):
+        visual_root = os.environ.get("VISUAL_OUTPUT_PATH")
+        if visual_root is None or self.save_path is None:
+            return
+        self.visual_save_path = Path(visual_root).resolve() / self.save_path.name
+        self.visual_save_path.mkdir(parents=True, exist_ok=True)
+        (self.visual_save_path / "rgb_all").mkdir(exist_ok=True)
+        (self.visual_save_path / "bev").mkdir(exist_ok=True)
 
     def sensors(self):
         sensors = super().sensors()
@@ -185,11 +196,12 @@ class Fail2DriveUniadAgent(Bench2DriveUniadAgent):
 
     def save(self, tick_data):
         frame = self.step
+        image_save_path = self.visual_save_path if self.visual_save_path is not None else self.save_path
 
         mosaic = self._make_sensor_mosaic(tick_data["imgs"])
-        Image.fromarray(mosaic).save(self.save_path / "rgb_all" / ("%06d.png" % frame))
+        Image.fromarray(mosaic).save(image_save_path / "rgb_all" / ("%06d.png" % frame))
         if not tick_data.get("bev_is_dummy", False):
-            Image.fromarray(tick_data["bev"]).save(self.save_path / "bev" / ("%06d.png" % frame))
+            Image.fromarray(tick_data["bev"]).save(image_save_path / "bev" / ("%06d.png" % frame))
 
         with open(self.save_path / "meta" / ("%06d.json" % frame), "w") as outfile:
             json.dump(self.pid_metadata, outfile, indent=4)

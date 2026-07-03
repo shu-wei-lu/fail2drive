@@ -28,6 +28,12 @@ RETRYABLE_STATUSES = {
     "Failed - Agent crashed",
 }
 
+FATAL_EVALUATOR_LOG_PATTERNS = (
+    "Watchdog exception - Timeout",
+    "The simulation took longer than",
+    "time-out of 300000ms while waiting for the simulator",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -60,6 +66,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Optional wall-clock timeout for the evaluator subprocess. 0 disables it.",
+    )
+    parser.add_argument(
+        "--evaluator-fatal-grace",
+        type=float,
+        default=30.0,
+        help=(
+            "Seconds to wait for the evaluator to exit after a fatal watchdog/CARLA "
+            "timeout appears in its logs before killing the evaluator process group."
+        ),
     )
     parser.add_argument(
         "--restart-carla",
@@ -178,6 +193,46 @@ def remove_incomplete_result(result_file: Path) -> None:
 
 def tee_command(command: Iterable[str]) -> str:
     return " ".join(str(part) for part in command)
+
+
+def log_contains_any(log_files: Iterable[Path], patterns: Iterable[str], max_bytes: int = 65536) -> bool:
+    for log_file in log_files:
+        try:
+            with log_file.open("rb") as file:
+                file.seek(0, os.SEEK_END)
+                size = file.tell()
+                file.seek(max(0, size - max_bytes), os.SEEK_SET)
+                text = file.read().decode("utf-8", errors="ignore")
+        except OSError:
+            continue
+        if any(pattern in text for pattern in patterns):
+            return True
+    return False
+
+
+def stop_process_group(
+    process: subprocess.Popen,
+    stdout,
+    reason: str,
+    terminate_timeout: float = 20.0,
+) -> int:
+    if process.poll() is not None:
+        return process.returncode
+
+    stdout.write(f"[local_evaluate] {reason}; killing evaluator process group\n")
+    stdout.flush()
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=terminate_timeout)
+        except subprocess.TimeoutExpired:
+            stdout.write("[local_evaluate] evaluator ignored SIGTERM; sending SIGKILL\n")
+            stdout.flush()
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=terminate_timeout)
+    except ProcessLookupError:
+        process.wait(timeout=terminate_timeout)
+    return process.returncode
 
 
 def carla_executable(args: argparse.Namespace) -> Path:
@@ -342,21 +397,42 @@ def run_route(args: argparse.Namespace, route: Path, seed: int, attempt: int) ->
             stderr=stderr,
             start_new_session=True,
         )
-        try:
-            return process.wait(timeout=args.evaluator_wall_timeout or None)
-        except subprocess.TimeoutExpired:
-            stdout.write(
-                f"[local_evaluate] evaluator timed out after "
-                f"{args.evaluator_wall_timeout:.1f}s; killing process group\n"
-            )
-            stdout.flush()
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=20.0)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=20.0)
-            return process.returncode
+        wall_deadline = None
+        if args.evaluator_wall_timeout > 0:
+            wall_deadline = time.monotonic() + args.evaluator_wall_timeout
+        fatal_seen_at = None
+
+        while True:
+            if process.poll() is not None:
+                return process.returncode
+
+            now = time.monotonic()
+            if wall_deadline is not None and now >= wall_deadline:
+                return stop_process_group(
+                    process,
+                    stdout,
+                    f"evaluator timed out after {args.evaluator_wall_timeout:.1f}s",
+                )
+
+            if fatal_seen_at is None and log_contains_any(
+                (out_file, err_file),
+                FATAL_EVALUATOR_LOG_PATTERNS,
+            ):
+                fatal_seen_at = now
+                stdout.write(
+                    "[local_evaluate] detected fatal evaluator timeout in logs; "
+                    f"waiting {args.evaluator_fatal_grace:.1f}s for clean exit\n"
+                )
+                stdout.flush()
+
+            if fatal_seen_at is not None and now - fatal_seen_at >= args.evaluator_fatal_grace:
+                return stop_process_group(
+                    process,
+                    stdout,
+                    "evaluator did not exit after fatal timeout",
+                )
+
+            time.sleep(1.0)
 
 
 def main() -> int:

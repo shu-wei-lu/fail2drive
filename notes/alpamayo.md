@@ -38,7 +38,6 @@ export VLM_VERBOSE=1
 
 export ACTIVATION_POLICY=vlm
 export ACTIVATION_VECTOR_PATHS="./steering/transfuser/post_process/Brake/steering_vector.pt,./steering/transfuser/post_process/left_change_lane/steering_vector.pt,./steering/transfuser/post_process/right_change_lane/steering_vector.pt"
-export NORMALIZE_STEERING_VECTOR=0
 
 python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
   --routes ./fail2drive_split/Base_BadParking_0004.xml \
@@ -71,7 +70,6 @@ export VLM_VERBOSE=0
 
 export ACTIVATION_POLICY=vlm
 export ACTIVATION_VECTOR_PATHS="./steering/transfuser/post_process/Brake/steering_vector.pt,./steering/transfuser/post_process/left_change_lane/steering_vector.pt,./steering/transfuser/post_process/right_change_lane/steering_vector.pt"
-export NORMALIZE_STEERING_VECTOR=0
 
 python local_evaluate.py \
   --routes fail2drive_split \

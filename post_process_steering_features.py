@@ -251,10 +251,26 @@ def classify_target_action(row: dict, run_name: str, match_context: str, args: a
 
 
 def classify_frame(row: dict, run_name: str, match_context: str, args: argparse.Namespace, adapter) -> str | None:
+  custom_label = adapter.classify_post_process_label(row, args.action, run_name, args)
+  if custom_label == 'skip':
+    return None
+  if custom_label == 'positive':
+    if matches_patterns(match_context, args.positive_include_pattern, args.positive_exclude_pattern):
+      return adapter.filter_post_process_label(row, 'positive', args.action, run_name, args)
+    return None
+  if custom_label == 'negative':
+    if matches_patterns(match_context, args.negative_include_pattern, args.negative_exclude_pattern):
+      if matches_patterns(match_context, args.normal_include_pattern, args.normal_exclude_pattern):
+        return adapter.filter_post_process_label(row, 'negative', args.action, run_name, args)
+    return None
+
   positive = classify_target_action(row, run_name, match_context, args, adapter)
   if positive is not None:
-    return positive
-  return classify_normal(row, match_context, args)
+    return adapter.filter_post_process_label(row, positive, args.action, run_name, args)
+  normal = classify_normal(row, match_context, args)
+  if normal is not None:
+    return adapter.filter_post_process_label(row, normal, args.action, run_name, args)
+  return None
 
 
 def main() -> int:
@@ -282,7 +298,8 @@ def main() -> int:
       run_name = run_name_for(log_source)
       match_context = match_context_for(log_source, run_name)
       rows_iter = read_jsonl(log_source) if log_source.name == 'activation_actions.jsonl' else read_measurements(log_source)
-      rows = adapter.annotate_rows(list(rows_iter), args)
+      rows = adapter.augment_rows(list(rows_iter), log_source, collection_root)
+      rows = adapter.annotate_rows(rows, args)
       for row in rows:
         total_rows += 1
         label = classify_frame(row, run_name, match_context, args, adapter)

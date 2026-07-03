@@ -38,6 +38,15 @@ class PlannerAdapter(ABC):
   def annotate_rows(self, rows: list[dict], args) -> list[dict]:
     return rows
 
+  def augment_rows(self, rows: list[dict], log_source: Path, collection_root: Path) -> list[dict]:
+    return rows
+
+  def classify_post_process_label(self, row: dict, action: str, run_name: str, args) -> str | None:
+    return None
+
+  def filter_post_process_label(self, row: dict, label: str, action: str, run_name: str, args) -> str | None:
+    return label
+
   @abstractmethod
   def classify_frame(self, row: dict, run_name: str, args) -> str | None:
     """Return 'brake', 'normal', or None for vector construction."""

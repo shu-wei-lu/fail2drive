@@ -10,11 +10,11 @@
     </waypoints>
     <scenarios>
       <scenario name="SteeringVehicleOnRoad" type="VehicleOnRoad">
-        <distance value="30" />
-        <stop_time value="20" />
+        <distance value="50" />
+        <stop_time value="30" />
         <vehicle value="vehicle.*" />
         <lateral_offset value="0" />
-        <trigger_point x="4656.5" y="2749.3" z="146.9" yaw="-88.9" />
+        <trigger_point x="4652.1" y="2994.1" z="148.0" yaw="-88.9" />
       </scenario>
     </scenarios>
   </route>

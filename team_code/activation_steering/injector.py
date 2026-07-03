@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 
 class ActivationInjector:
@@ -20,11 +19,11 @@ class ActivationInjector:
       self,
       vector_path: Path | None = None,
       vector_paths: list[Path | None] | None = None,
-      normalize: bool = True,
+      action_alpha_scales: list[float] | None = None,
   ):
     self.vector_path = Path(vector_path) if vector_path else None
     self.vector_paths = [Path(path) if path else None for path in vector_paths] if vector_paths else None
-    self.normalize = bool(normalize)
+    self.action_alpha_scales = action_alpha_scales or [1.0 for _ in self.ACTIONS]
     self._vector = None
     self._vectors = None
     self._warned_disabled = False
@@ -41,7 +40,7 @@ class ActivationInjector:
     return cls(
         vector_path=Path(vector_path) if vector_path else None,
         vector_paths=vector_paths,
-        normalize=bool(int(os.environ.get("NORMALIZE_STEERING_VECTOR", os.environ.get("NORMALIZE_ACTIVATION_VECTOR", 1)))),
+        action_alpha_scales=cls._action_alpha_scales_from_env(),
     )
 
   def enabled(self, alpha: float) -> bool:
@@ -78,8 +77,6 @@ class ActivationInjector:
     if self.vector_path is None:
       raise RuntimeError("ActivationInjector has no vector path. Set ACTIVATION_VECTOR_PATH to enable it.")
     vector = torch.load(self.vector_path, map_location="cpu").detach().float()
-    if self.normalize:
-      vector = F.normalize(vector.reshape(1, -1), dim=1).reshape_as(vector)
     return vector
 
   def apply(self, features: torch.Tensor, alpha: float | None = None) -> torch.Tensor:
@@ -113,14 +110,22 @@ class ActivationInjector:
     vectors = self.action_vectors(features)
     result = features
     alpha_vector = alpha_vector.to(device=features.device, dtype=features.dtype)
+    alpha_scales = torch.as_tensor(self.action_alpha_scales, device=features.device, dtype=features.dtype)
+    scaled_alpha_vector = alpha_vector * alpha_scales
     active = []
-    for index, alpha in enumerate(alpha_vector):
-      if float(alpha.detach().cpu()) == 0.0:
+    for index, alpha in enumerate(scaled_alpha_vector):
+      effective_alpha = float(alpha.detach().cpu())
+      if effective_alpha == 0.0:
         continue
       vector = vectors[index]
       if vector is None:
         continue
-      active.append(f"{self.ACTIONS[index]}={float(alpha.detach().cpu()):.3f}")
+      raw_alpha = float(alpha_vector[index].detach().cpu())
+      scale = float(alpha_scales[index].detach().cpu())
+      if scale == 1.0:
+        active.append(f"{self.ACTIONS[index]}={effective_alpha:.3f}")
+      else:
+        active.append(f"{self.ACTIONS[index]}={effective_alpha:.3f}({raw_alpha:.3f}x{scale:.3f})")
       result = result + alpha * vector
     if active and self.verbose:
       print("[ActivationInjector] apply actions:", ", ".join(active))
@@ -137,8 +142,6 @@ class ActivationInjector:
     if path is None:
       return None
     vector = torch.load(path, map_location="cpu").detach().float()
-    if self.normalize:
-      vector = F.normalize(vector.reshape(1, -1), dim=1).reshape_as(vector)
     return vector
 
   def _has_action_vectors(self) -> bool:
@@ -161,3 +164,18 @@ class ActivationInjector:
     if any(action_paths):
       return [Path(path) if path else None for path in action_paths]
     return None
+
+  @classmethod
+  def _action_alpha_scales_from_env(cls) -> list[float]:
+    scales_spec = os.environ.get("ACTIVATION_ACTION_ALPHA_SCALES")
+    if scales_spec:
+      raw_scales = [item.strip() for item in scales_spec.split(",")]
+      if len(raw_scales) != len(cls.ACTIONS):
+        raise ValueError("ACTIVATION_ACTION_ALPHA_SCALES must contain exactly 3 comma-separated values: brake,left,right.")
+      return [float(value) for value in raw_scales]
+
+    return [
+        float(os.environ.get("BRAKE_ACTIVATION_ALPHA_SCALE", "1.0")),
+        float(os.environ.get("LEFT_ACTIVATION_ALPHA_SCALE", "1.0")),
+        float(os.environ.get("RIGHT_ACTIVATION_ALPHA_SCALE", "1.0")),
+    ]

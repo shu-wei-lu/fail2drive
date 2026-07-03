@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from activation_steering.transfuser_target_speed import TransFuserTargetSpeedAdapter
+from activation_steering.hipad_plan import HiPADPlanAdapter
 from activation_steering.uniad_traj import UniADTrajectoryAdapter
 from activation_steering.vad_traj import VADTrajectoryAdapter
 
 
 _ADAPTERS = {
     TransFuserTargetSpeedAdapter.name: TransFuserTargetSpeedAdapter,
+    HiPADPlanAdapter.name: HiPADPlanAdapter,
+    "hipad": HiPADPlanAdapter,
     VADTrajectoryAdapter.name: VADTrajectoryAdapter,
     UniADTrajectoryAdapter.name: UniADTrajectoryAdapter,
 }

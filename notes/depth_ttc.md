@@ -48,7 +48,6 @@ export DEPTH_TTC_EVERY_N=5
 export DEPTH_TTC_HOLD_FRAMES=5
 
 export ACTIVATION_VECTOR_PATHS="./steering/transfuser/post_process/Brake/steering_vector.pt,./steering/transfuser/post_process/left_change_lane/steering_vector.pt,./steering/transfuser/post_process/right_change_lane/steering_vector.pt"
-export NORMALIZE_STEERING_VECTOR=0
 ```
 
 `DEPTH_TTC_EVERY_N` controls how often the planner runs the four-candidate scoring request. `DEPTH_TTC_HOLD_FRAMES` controls how long the selected `brake/left/right` action remains active after a scoring response. Non-scoring frames only forward the held candidate, so this avoids scoring and four-way planner inference every tick.

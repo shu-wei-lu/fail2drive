@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
       help='Open the pygame live visualizer while collecting features.',
   )
   parser.add_argument(
+      '--no-other-vehicles',
+      action='store_true',
+      help='Set NO_OTHER_VEHICLES=1 for the evaluator to disable background and parked vehicles.',
+  )
+  parser.add_argument(
       '--env',
       action='append',
       default=[],
@@ -119,6 +124,7 @@ def run_route(args: argparse.Namespace, route: Path, output_root: Path, env: dic
   with (stdout_dir / f'{route_run_id}.log').open('a', encoding='utf-8') as stdout, \
       (stderr_dir / f'{route_run_id}.log').open('a', encoding='utf-8') as stderr:
     stdout.write('[create_steering_features] ' + ' '.join(command) + '\n')
+    stdout.write(f'[create_steering_features] NO_OTHER_VEHICLES={env.get("NO_OTHER_VEHICLES", "")}\n')
     stdout.flush()
     return subprocess.run(command, env=env, stdout=stdout, stderr=stderr, check=False).returncode
 
@@ -144,6 +150,8 @@ def main() -> int:
     images_root.mkdir(parents=True, exist_ok=True)
   if args.live_visual_output:
     env['LIVE_VISU'] = 'True'
+  if args.no_other_vehicles:
+    env['NO_OTHER_VEHICLES'] = '1'
   env.update(parse_env_overrides(args.env))
 
   routes = list_routes(args.routes, args.route_filter, args.route_limit)
@@ -154,6 +162,8 @@ def main() -> int:
     print(f'Visual output: {images_root}')
   if args.live_visual_output:
     print('Live pygame visualizer: enabled via LIVE_VISU=True')
+  if env.get('NO_OTHER_VEHICLES', '0').lower() in ('1', 'true', 'yes', 'y'):
+    print('Other vehicles: disabled via NO_OTHER_VEHICLES=1')
   if args.max_frames > 0:
     print(f'Max frames per run: {args.max_frames}')
 

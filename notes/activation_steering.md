@@ -39,9 +39,9 @@ Equivalent compact form, also in `brake,left,right` order:
 export ACTIVATION_ACTION_ALPHA_SCALES=2.0,1.0,1.0
 ```
 
-These values multiply the policy output. For example, oracle with
-`ORACLE_ALPHA=1.0` and `BRAKE_ACTIVATION_ALPHA_SCALE=2.0` applies brake with an
-effective alpha of `2.0`.
+These values multiply the policy output. For example, PDM oracle with
+`PDM_ORACLE_ALPHA=1.0` and `BRAKE_ACTIVATION_ALPHA_SCALE=2.0` applies brake
+with an effective alpha of `2.0`.
 
 ## 1. Start CARLA
 
@@ -235,19 +235,57 @@ This is a multiplier on the policy alpha. If a policy already emits brake
 alpha `2.0`, setting `BRAKE_ACTIVATION_ALPHA_SCALE=2.0` makes the effective
 brake alpha `4.0`.
 
-### Oracle
+### PDM Oracle
 
-Uses scenario-runner / CARLA privileged state to trigger action vectors.
+Uses scenario-runner / CARLA privileged state and online actor geometry to
+trigger action vectors. This is the only oracle policy path; legacy
+`ACTIVATION_POLICY=oracle` and `ORACLE_*` flags are still accepted as fallback,
+but new runs should use `pdm_oracle` and `PDM_ORACLE_*`.
 
 ```bash
-export ACTIVATION_POLICY=oracle
-export ORACLE_ALPHA=1.0
+export ACTIVATION_POLICY=pdm_oracle
+export PDM_ORACLE_ALPHA=1.0
 export BRAKE_ACTIVATION_ALPHA_SCALE=2.0
 export LEFT_ACTIVATION_ALPHA_SCALE=1.0
 export RIGHT_ACTIVATION_ALPHA_SCALE=1.0
-export ORACLE_TRIGGER_DISTANCE=35.0
-export ORACLE_HOLD_FRAMES=12
-export ORACLE_COOLDOWN_FRAMES=30
+export PDM_ORACLE_TRIGGER_DISTANCE=50.0
+export PDM_ORACLE_HOLD_FRAMES=8
+export PDM_ORACLE_COOLDOWN_FRAMES=20
+export PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=70.0
+export PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE=90.0
+export PDM_ORACLE_GENERAL_BRAKE=0
+```
+
+Parameter notes:
+
+- `PDM_ORACLE_TRIGGER_DISTANCE`: default distance gate for route-obstacle scenarios. The policy only considers most scenario actors when the first actor is within this many meters of ego. This mirrors PDM-Lite's `default_max_distance_to_process_scenario=50`.
+- `PDM_ORACLE_HOLD_FRAMES`: number of consecutive evaluator frames to keep the selected action alpha active after one trigger.
+- `PDM_ORACLE_COOLDOWN_FRAMES`: number of frames after a held trigger before the same action can trigger again.
+- `PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE`: lookahead distance along the temporary opposite-lane/overtaking lane used by the simplified clearance check. If another vehicle is in that lane from 5 m behind ego to this distance ahead, lateral action is suppressed.
+- `PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE`: distance used to collect road/lane ids before and after the target opposite lane for the clearance check.
+- `PDM_ORACLE_GENERAL_BRAKE`: optional fallback. When enabled, the policy can brake for any live vehicle/walker that satisfies the simple brake-hazard geometry even if no active scenario produced a trigger. Keep `0` when you only want scenario-runner oracle triggers.
+
+This activation policy is PDM-like, not the original PDM-Lite controller. The
+real Fail2Drive PDM-Lite expert is `team_code/visu_agent.py`, which subclasses
+`AutoPilot` and rewrites its privileged route / target speed directly. Its
+closest native parameters live in `team_code/config.py`:
+
+```text
+detection_radius = 50.0
+default_max_distance_to_process_scenario = 50
+max_distance_to_process_hazard_at_side_lane = 25
+max_distance_to_process_hazard_at_side_lane_two_ways = 10
+previous_road_lane_retrieve_distance = 100 waypoints
+check_path_free_safety_distance = 10 m
+check_path_free_safety_time = 0.2 s
+max_distance_to_overtake_two_way_scnearios = 8 m
+distance_to_delete_scenario_in_two_ways = 2 m
+default_overtake_speed = 50 / 3.6 m/s
+overtake_speed_vehicle_opens_door_two_ways = 40 / 3.6 m/s
+idm_two_way_scenarios_minimum_distance = 2.0 m
+idm_two_way_scenarios_time_headway = 0.1 s
+braking_distance_calculation_safety_distance = 10 m
+lane_shift_extension_length_for_yield_to_emergency_vehicle = 20 m
 ```
 
 Use this to verify whether the vectors can help when the trigger is clean.
@@ -329,7 +367,7 @@ export CUDA_VISIBLE_DEVICES=6
 export LIVE_VISU=0
 export DEBUG_CHALLENGE=0
 
-export ACTIVATION_POLICY=<oracle|vlm|depth_ttc>
+export ACTIVATION_POLICY=<pdm_oracle|vlm|depth_ttc>
 export ACTIVATION_VECTOR_PATHS="./steering/<planner>/post_process/Brake/steering_vector.pt,./steering/<planner>/post_process/left_change_lane/steering_vector.pt,./steering/<planner>/post_process/right_change_lane/steering_vector.pt"
 
 python local_evaluate.py \
@@ -392,7 +430,7 @@ Before running on a new cluster, check:
 3. Collect `Normal`, `Brake`, `LaneChangeLeft`, and `LaneChangeRight`.
 4. Post-process three vectors against `Normal`.
 5. Set `ACTIVATION_VECTOR_PATHS` in `brake,left,right` order.
-6. Choose policy: `oracle`, `vlm`, or `depth_ttc`.
+6. Choose policy: `pdm_oracle`, `vlm`, or `depth_ttc`.
 7. Run a one-route smoke test.
 8. Run full local or SLURM evaluation.
 9. Parse results and inspect failures/logs.

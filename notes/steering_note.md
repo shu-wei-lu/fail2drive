@@ -12,8 +12,8 @@ Activation steering has two separate parts:
 Main policy selector:
 
 ```bash
-ACTIVATION_POLICY=oracle        # or pdm_oracle, depth_ttc
-STEERING_POLICY=oracle          # alias used when ACTIVATION_POLICY is unset
+ACTIVATION_POLICY=pdm_oracle    # or vlm, depth_ttc
+STEERING_POLICY=pdm_oracle      # alias used when ACTIVATION_POLICY is unset
 ```
 
 If no named policy is selected, setting `STEERING_ALPHA` or `ACTIVATION_ALPHA` enables `FixedAfterFramePolicy`.
@@ -105,55 +105,19 @@ Equivalent compact form, in `brake,left,right` order:
 ACTIVATION_ACTION_ALPHA_SCALES=2.0,1.0,1.0
 ```
 
-These are injector-side multipliers on the policy alpha. For example, oracle
-with `ORACLE_ALPHA=1.0` and `BRAKE_ACTIVATION_ALPHA_SCALE=2.0` applies the
-brake vector with effective alpha `2.0`. If a policy already outputs brake
-alpha `2.0`, the same scale makes the effective brake alpha `4.0`.
+These are injector-side multipliers on the policy alpha. For example, PDM
+oracle with `PDM_ORACLE_ALPHA=1.0` and `BRAKE_ACTIVATION_ALPHA_SCALE=2.0`
+applies the brake vector with effective alpha `2.0`. If a policy already
+outputs brake alpha `2.0`, the same scale makes the effective brake alpha
+`4.0`.
 
 Important: with `ACTIVATION_VECTOR_PATHS`, scalar fixed-frame alpha becomes `[alpha,0,0]`, so it maps to brake. For fixed-frame left/right, use single-vector mode unless the policy returns `[brake,left,right]`.
 
-## Oracle Policy
-
-Enable:
-
-```bash
-ACTIVATION_POLICY=oracle
-ORACLE_STEERING=1
-ORACLE_POLICY=1
-```
-
-Core flags:
-
-```bash
-ORACLE_ACTION=auto        # auto, brake, left, right
-ACTIVATION_ACTION=auto    # fallback alias
-ORACLE_ALPHA=1.0
-STEERING_ALPHA=1.0        # fallback
-ACTIVATION_ALPHA=1.0      # fallback
-BRAKE_ACTIVATION_ALPHA_SCALE=2.0
-LEFT_ACTIVATION_ALPHA_SCALE=1.0
-RIGHT_ACTIVATION_ALPHA_SCALE=1.0
-ORACLE_TRIGGER_DISTANCE=35.0
-ORACLE_MIN_DISTANCE=0.0
-ORACLE_HOLD_FRAMES=12
-ORACLE_COOLDOWN_FRAMES=30
-ORACLE_ALLOW_MULTI_ACTION=0
-ORACLE_VERBOSE=0
-```
-
-Brake hazard flags:
-
-```bash
-ORACLE_BRAKE_HAZARD_DISTANCE=20.0
-ORACLE_BRAKE_HAZARD_LATERAL_MARGIN=2.5
-ORACLE_BRAKE_REACTION_TIME=0.4
-ORACLE_BRAKE_DECELERATION=6.0
-ORACLE_BRAKE_DISTANCE_MARGIN=2.0
-ORACLE_BRAKE_TTC_THRESHOLD=2.0
-ORACLE_BRAKE_MIN_CLOSING_SPEED=0.5
-```
-
 ## PDM Oracle Policy
+
+This is the only oracle policy path. The old `ACTIVATION_POLICY=oracle` and
+`ORACLE_*` flags still route to `PDMOraclePolicy` for compatibility, but new
+runs should use `pdm_oracle` and `PDM_ORACLE_*`.
 
 Enable:
 
@@ -163,11 +127,17 @@ PDM_ORACLE_STEERING=1
 PDM_ORACLE_POLICY=1
 ```
 
-PDM oracle accepts the same base flags with `PDM_ORACLE_` prefix and falls back to `ORACLE_`:
+Core flags:
 
 ```bash
-PDM_ORACLE_ACTION=auto
+PDM_ORACLE_ACTION=auto    # auto, brake, left, right
+ACTIVATION_ACTION=auto    # fallback alias
 PDM_ORACLE_ALPHA=1.0
+STEERING_ALPHA=1.0        # fallback
+ACTIVATION_ALPHA=1.0      # fallback
+BRAKE_ACTIVATION_ALPHA_SCALE=2.0
+LEFT_ACTIVATION_ALPHA_SCALE=1.0
+RIGHT_ACTIVATION_ALPHA_SCALE=1.0
 PDM_ORACLE_TRIGGER_DISTANCE=50.0
 PDM_ORACLE_MIN_DISTANCE=0.0
 PDM_ORACLE_HOLD_FRAMES=8
@@ -176,7 +146,7 @@ PDM_ORACLE_ALLOW_MULTI_ACTION=0
 PDM_ORACLE_VERBOSE=0
 ```
 
-Extra PDM oracle flags:
+PDM scenario tuning flags:
 
 ```bash
 PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=70.0
@@ -187,6 +157,37 @@ PDM_ORACLE_ROADBLOCKED_DISTANCE=40.0
 PDM_ORACLE_PRIORITY_DISTANCE=50.0
 PDM_ORACLE_YIELD_EMERGENCY_DISTANCE=50.0
 PDM_ORACLE_GENERAL_BRAKE=0
+```
+
+Meaning of the common PDM oracle gates:
+
+- `PDM_ORACLE_TRIGGER_DISTANCE`: default active-scenario distance gate in meters.
+- `PDM_ORACLE_HOLD_FRAMES`: keep a trigger active for this many frames after it fires.
+- `PDM_ORACLE_COOLDOWN_FRAMES`: wait this many frames after a held trigger before the same action can fire again.
+- `PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE`: vehicle-clearance lookahead distance for two-way/overtaking lateral actions.
+- `PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE`: distance used to collect target lane ids around ego for the two-way clearance check.
+- `PDM_ORACLE_GENERAL_BRAKE`: enable a non-scenario fallback brake trigger for any nearby vehicle/walker satisfying the brake-hazard geometry.
+
+Original PDM-Lite does not use `hold_frames` or `cooldown_frames`; those are
+activation-steering stabilizers. The closest original `AutoPilot`/PDM-Lite
+parameters are:
+
+```bash
+detection_radius=50.0
+default_max_distance_to_process_scenario=50
+max_distance_to_process_hazard_at_side_lane=25
+max_distance_to_process_hazard_at_side_lane_two_ways=10
+previous_road_lane_retrieve_distance=100
+check_path_free_safety_distance=10
+check_path_free_safety_time=0.2
+max_distance_to_overtake_two_way_scnearios=8
+distance_to_delete_scenario_in_two_ways=2
+default_overtake_speed=50/3.6
+overtake_speed_vehicle_opens_door_two_ways=40/3.6
+idm_two_way_scenarios_minimum_distance=2.0
+idm_two_way_scenarios_time_headway=0.1
+braking_distance_calculation_safety_distance=10
+lane_shift_extension_length_for_yield_to_emergency_vehicle=20
 ```
 
 PDM oracle brake hazard flags:

@@ -110,12 +110,11 @@ class VLMPolicy(ActivationPolicy):
     return None
 
 
-class OraclePolicy(ActivationPolicy):
-  """Uses scenario-runner oracle state to gate activation steering.
+class _BaseOraclePolicy(ActivationPolicy):
+  """Shared state machine and geometry helpers for online oracle policies.
 
-  This follows the same privileged signal PDM-Lite uses for route-obstacle
-  handling: CarlaDataProvider.active_scenarios stores the currently relevant
-  scenario actors. It returns [brake, left, right] action alphas.
+  CarlaDataProvider.active_scenarios stores currently relevant scenario actors.
+  Subclasses map those signals into [brake, left, right] action alphas.
   """
 
   ACTIONS = ("brake", "left", "right")
@@ -158,28 +157,6 @@ class OraclePolicy(ActivationPolicy):
     self._cooldown_until = [-1 for _ in self.ACTIONS]
     self._last_trigger_key = None
 
-  @classmethod
-  def from_env(cls) -> "OraclePolicy":
-    action = os.environ.get("ORACLE_ACTION", os.environ.get("ACTIVATION_ACTION", "auto"))
-    alpha = float(os.environ.get("ORACLE_ALPHA", os.environ.get("STEERING_ALPHA", os.environ.get("ACTIVATION_ALPHA", 1.0))))
-    return cls(
-        alpha=alpha,
-        action=action,
-        trigger_distance=float(os.environ.get("ORACLE_TRIGGER_DISTANCE", 35.0)),
-        min_distance=float(os.environ.get("ORACLE_MIN_DISTANCE", 0.0)),
-        brake_hazard_distance=float(os.environ.get("ORACLE_BRAKE_HAZARD_DISTANCE", 20.0)),
-        brake_hazard_lateral_margin=float(os.environ.get("ORACLE_BRAKE_HAZARD_LATERAL_MARGIN", 2.5)),
-        brake_reaction_time=float(os.environ.get("ORACLE_BRAKE_REACTION_TIME", 0.4)),
-        brake_deceleration=float(os.environ.get("ORACLE_BRAKE_DECELERATION", 6.0)),
-        brake_distance_margin=float(os.environ.get("ORACLE_BRAKE_DISTANCE_MARGIN", 2.0)),
-        brake_ttc_threshold=float(os.environ.get("ORACLE_BRAKE_TTC_THRESHOLD", 2.0)),
-        brake_min_closing_speed=float(os.environ.get("ORACLE_BRAKE_MIN_CLOSING_SPEED", 0.5)),
-        hold_frames=int(os.environ.get("ORACLE_HOLD_FRAMES", 12)),
-        cooldown_frames=int(os.environ.get("ORACLE_COOLDOWN_FRAMES", 30)),
-        allow_multi_action=_strtobool(os.environ.get("ORACLE_ALLOW_MULTI_ACTION")),
-        verbose=_strtobool(os.environ.get("ORACLE_VERBOSE")),
-    )
-
   def alpha(self, frame: int) -> list[float]:
     alpha_vector = [0.0 for _ in self.ACTIONS]
     if self.fixed_alpha <= 0.0:
@@ -210,32 +187,7 @@ class OraclePolicy(ActivationPolicy):
     return alpha_vector
 
   def _oracle_triggers(self) -> list[tuple[str, str, int | None, float]]:
-    try:
-      from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
-    except Exception:
-      return []
-
-    try:
-      ego = CarlaDataProvider.get_hero_actor()
-    except Exception:
-      ego = None
-    if ego is None or not getattr(ego, "is_alive", True):
-      return []
-
-    ego_location = ego.get_location()
-    triggers = []
-    for scenario_type, scenario_data in list(getattr(CarlaDataProvider, "active_scenarios", [])):
-      actor = self._first_alive_actor(scenario_data)
-      if actor is None:
-        continue
-      action = self._action_from_autopilot_state(scenario_data, ego, actor)
-      if action is None or not self._action_allowed(action):
-        continue
-      distance = self._horizontal_distance(ego_location, actor.get_location())
-      if self.min_distance <= distance <= self.trigger_distance:
-        actor_id = getattr(actor, "id", None)
-        triggers.append((action, scenario_type, actor_id, distance))
-    return triggers
+    raise NotImplementedError
 
   def _select_triggers(self, triggers: list[tuple[str, str, int | None, float]]) -> list[tuple[str, str, int | None, float]]:
     if self.allow_multi_action:
@@ -259,24 +211,9 @@ class OraclePolicy(ActivationPolicy):
       return
     self._last_trigger_key = trigger_key
     print(
-        f"[OraclePolicy] frame={frame} action={action} scenario={scenario_type} actor={actor_id} "
+        f"[{self.__class__.__name__}] frame={frame} action={action} scenario={scenario_type} actor={actor_id} "
         f"distance={distance:.1f} alpha={self.fixed_alpha:.3f}",
         flush=True)
-
-  def _action_from_autopilot_state(self, scenario_data, ego=None, actor=None) -> str | None:
-    direction = self._scenario_direction(scenario_data)
-    if direction == "right":
-      return "left"
-    if direction == "left":
-      return "right"
-
-    invading_offset = self._invading_turn_offset(scenario_data)
-    if invading_offset is not None:
-      return "left" if invading_offset > 0.0 else "right"
-
-    if ego is not None and actor is not None and self._scenario_actor_brake_hazard(ego, actor):
-      return "brake"
-    return None
 
   def _action_allowed(self, action: str) -> bool:
     if self.action in ("auto", "any", "all"):
@@ -355,17 +292,15 @@ class OraclePolicy(ActivationPolicy):
     return math.hypot(dx, dy)
 
 
-class PDMOraclePolicy(OraclePolicy):
+class PDMOraclePolicy(_BaseOraclePolicy):
   """Conservative PDM-like oracle using only online CARLA actor/scenario state.
 
   This policy does not consume PDM-Lite labels or expert trajectories. It maps
-  scenario-runner active_scenarios plus live actor geometry into the same action
-  vector as OraclePolicy: [brake, left, right].
-
-  The main difference from OraclePolicy is that two-way obstacle scenarios do not
-  trigger lateral steering unless a simple opposite-lane clearance check passes.
-  If the path is not clear, the policy stays inactive unless the obstacle is an
-  imminent brake hazard.
+  scenario-runner active_scenarios plus live actor geometry into
+  [brake, left, right]. Two-way obstacle scenarios do not trigger lateral
+  steering unless a simple opposite-lane clearance check passes. If the path is
+  not clear, the policy stays inactive unless the obstacle is an imminent brake
+  hazard.
   """
 
   ONE_WAY_LATERAL_SCENARIOS = frozenset({
@@ -756,7 +691,7 @@ def policy_from_env(vlm_enabled: bool = False) -> ActivationPolicy:
       _strtobool(os.environ.get("PDM_ORACLE_STEERING")) or _strtobool(os.environ.get("PDM_ORACLE_POLICY"))):
     return PDMOraclePolicy.from_env()
   if policy_name == "oracle" or _strtobool(os.environ.get("ORACLE_STEERING")) or _strtobool(os.environ.get("ORACLE_POLICY")):
-    return OraclePolicy.from_env()
+    return PDMOraclePolicy.from_env()
 
   alpha = float(os.environ.get("STEERING_ALPHA", os.environ.get("ACTIVATION_ALPHA", 0.0)))
   start_frame = int(os.environ.get("START_STEERING_FRAME", os.environ.get("ACTIVATION_START_FRAME", 0)))

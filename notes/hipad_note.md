@@ -34,12 +34,27 @@ SAVE_HIPAD_PLAN_FEATURES=1 python create_steering_features_all_splits.py \
 
 # run local evaluate
 export CUDA_VISIBLE_DEVICES=6
-export ACTIVATION_POLICY=oracle
-export ORACLE_ACTION=auto
-export ORACLE_ALPHA=1.0
-export ORACLE_TRIGGER_DISTANCE=35
-export ORACLE_HOLD_FRAMES=30
-export ORACLE_COOLDOWN_FRAMES=30
+export ACTIVATION_POLICY=pdm_oracle
+export PDM_ORACLE_ACTION=auto
+export PDM_ORACLE_ALPHA=1.0
+
+# PDM oracle trigger gates. These are activation-steering gates, not exact
+# PDM-Lite route-planner internals.
+# - TRIGGER_DISTANCE: default active-scenario distance gate in meters.
+# - HOLD_FRAMES / COOLDOWN_FRAMES: keep one trigger stable, then prevent repeat firing.
+# - TWO_WAY_CLEAR_DISTANCE / LANE_KEY_SEARCH_DISTANCE: simplified clearance check for opposite-lane actions.
+# - GENERAL_BRAKE=0: only use scenario-runner triggers; set 1 for generic actor brake fallback.
+export PDM_ORACLE_TRIGGER_DISTANCE=50
+export PDM_ORACLE_HOLD_FRAMES=8
+export PDM_ORACLE_COOLDOWN_FRAMES=20
+export PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=70
+export PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE=90
+export PDM_ORACLE_SIDE_HAZARD_DISTANCE=25
+export PDM_ORACLE_SIDE_HAZARD_TWO_WAY_DISTANCE=10
+export PDM_ORACLE_ROADBLOCKED_DISTANCE=40
+export PDM_ORACLE_PRIORITY_DISTANCE=50
+export PDM_ORACLE_YIELD_EMERGENCY_DISTANCE=50
+export PDM_ORACLE_GENERAL_BRAKE=0
 
 export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad/post_process/brake_strong/steering_vector.pt,$F2D/steering/hipad/post_process/left_change_lane_meta/steering_vector.pt,$F2D/steering/hipad/post_process/right_change_lane_meta/steering_vector.pt"
 export BRAKE_ACTIVATION_ALPHA_SCALE=2.0
@@ -50,7 +65,7 @@ python local_evaluate.py \
   --routes fail2drive_split \
   --seeds 1 \
   --retries 1 \
-  --out_root results/hipad_oracle \
+  --out_root results/hipad_pdm_oracle \
   --agent_file ./team_code/hipad_f2d_agent.py \
   --agent_config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
   --restart-carla \

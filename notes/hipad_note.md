@@ -13,6 +13,10 @@ export IS_BENCH2DRIVE=1
 --agent_file $F2D/team_code/hipad_f2d_agent.py \
 --agent_config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
 
+# carla
+./f2d_carla/CarlaUE4.sh -RenderOffScreen -graphicsadapter=7
+
+# run
 LIVE_VISU=0 SAVE_PATH=./viz_vehicle DEBUG_CHALLENGE=1 \
 python leaderboard/leaderboard/leaderboard_evaluator_local.py --agent ./team_code/hipad_f2d_agent.py   --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" --routes ./fail2drive_split/Generalization_PedestriansOnRoad_1085.xml
 
@@ -44,9 +48,12 @@ export PDM_ORACLE_ALPHA=1.0
 # - HOLD_FRAMES / COOLDOWN_FRAMES: keep one trigger stable, then prevent repeat firing.
 # - TWO_WAY_CLEAR_DISTANCE / LANE_KEY_SEARCH_DISTANCE: simplified clearance check for opposite-lane actions.
 # - GENERAL_BRAKE=0: only use scenario-runner triggers; set 1 for generic actor brake fallback.
-export PDM_ORACLE_TRIGGER_DISTANCE=50
-export PDM_ORACLE_HOLD_FRAMES=8
-export PDM_ORACLE_COOLDOWN_FRAMES=20
+export ACTIVATION_POLICY=pdm_oracle
+export PDM_ORACLE_ACTION=auto
+export PDM_ORACLE_ALPHA=1.0
+export PDM_ORACLE_TRIGGER_DISTANCE=20
+export PDM_ORACLE_HOLD_FRAMES=30
+export PDM_ORACLE_COOLDOWN_FRAMES=40
 export PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=70
 export PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE=90
 export PDM_ORACLE_SIDE_HAZARD_DISTANCE=25
@@ -57,9 +64,12 @@ export PDM_ORACLE_YIELD_EMERGENCY_DISTANCE=50
 export PDM_ORACLE_GENERAL_BRAKE=0
 
 export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad/post_process/brake_strong/steering_vector.pt,$F2D/steering/hipad/post_process/left_change_lane_meta/steering_vector.pt,$F2D/steering/hipad/post_process/right_change_lane_meta/steering_vector.pt"
+
 export BRAKE_ACTIVATION_ALPHA_SCALE=2.0
 export LEFT_ACTIVATION_ALPHA_SCALE=1.0
 export RIGHT_ACTIVATION_ALPHA_SCALE=1.0
+
+#### 
 
 python local_evaluate.py \
   --routes fail2drive_split \
@@ -70,5 +80,4 @@ python local_evaluate.py \
   --agent_config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
   --restart-carla \
   --carla-root ./f2d_carla \
-  --graphics-adapter 6 \
-  --force
+  --graphics-adapter 4 \

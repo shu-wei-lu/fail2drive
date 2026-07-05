@@ -59,6 +59,14 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument('--model-index', type=int, default=0, help='Feature subdir to use for ensembles.')
   parser.add_argument('--max-frames-per-class', type=int, default=0)
   parser.add_argument('--flatten', action='store_true', help='Flatten each feature tensor before averaging.')
+  parser.add_argument(
+      '--manual',
+      action='store_true',
+      help=(
+          'Use manually picked positive frames from '
+          '<collection-root>/<ActionDir>/picked_frames.json. Negative selection is unchanged.'
+      ),
+  )
   parser.add_argument('--steer-threshold', type=float, default=0.2)
   parser.add_argument('--normal-max-abs-steer', type=float, default=0.05)
   parser.add_argument(
@@ -104,6 +112,34 @@ def matches_patterns(name: str, include_patterns: list[str], exclude_patterns: l
   if any(pattern in name for pattern in exclude_patterns):
     return False
   return True
+
+
+def action_dir_name(action: str) -> str:
+  if action == 'brake':
+    return 'Brake'
+  if action == 'left_change_lane':
+    return 'Left'
+  if action == 'right_change_lane':
+    return 'Right'
+  return action
+
+
+def load_manual_positive_frames(collection_root: Path, action: str) -> tuple[dict[str, set[int]], Path]:
+  path = collection_root / action_dir_name(action) / 'picked_frames.json'
+  if not path.exists():
+    raise FileNotFoundError(f'--manual expected picked frames at {path}')
+
+  with path.open('r', encoding='utf-8') as f:
+    raw = json.load(f)
+  if not isinstance(raw, dict):
+    raise ValueError(f'--manual picked frames must be a JSON object: {path}')
+
+  picked: dict[str, set[int]] = {}
+  for run_name, frames in raw.items():
+    if not isinstance(run_name, str) or not isinstance(frames, list):
+      raise ValueError(f'--manual expected Dict[str, List[int]] in {path}')
+    picked[run_name] = {int(frame) for frame in frames}
+  return picked, path
 
 
 def read_jsonl(path: Path) -> Iterable[dict]:
@@ -251,10 +287,20 @@ def classify_target_action(row: dict, run_name: str, match_context: str, args: a
 
 
 def classify_frame(row: dict, run_name: str, match_context: str, args: argparse.Namespace, adapter) -> str | None:
+  if args.manual:
+    manual_frames = getattr(args, '_manual_positive_frames', {})
+    frame = int(row['frame'])
+    if frame in manual_frames.get(run_name, set()):
+      if matches_patterns(match_context, args.positive_include_pattern, args.positive_exclude_pattern):
+        return adapter.filter_post_process_label(row, 'positive', args.action, run_name, args)
+      return None
+
   custom_label = adapter.classify_post_process_label(row, args.action, run_name, args)
   if custom_label == 'skip':
     return None
   if custom_label == 'positive':
+    if args.manual:
+      return None
     if matches_patterns(match_context, args.positive_include_pattern, args.positive_exclude_pattern):
       return adapter.filter_post_process_label(row, 'positive', args.action, run_name, args)
     return None
@@ -264,9 +310,10 @@ def classify_frame(row: dict, run_name: str, match_context: str, args: argparse.
         return adapter.filter_post_process_label(row, 'negative', args.action, run_name, args)
     return None
 
-  positive = classify_target_action(row, run_name, match_context, args, adapter)
-  if positive is not None:
-    return adapter.filter_post_process_label(row, positive, args.action, run_name, args)
+  if not args.manual:
+    positive = classify_target_action(row, run_name, match_context, args, adapter)
+    if positive is not None:
+      return adapter.filter_post_process_label(row, positive, args.action, run_name, args)
   normal = classify_normal(row, match_context, args)
   if normal is not None:
     return adapter.filter_post_process_label(row, normal, args.action, run_name, args)
@@ -281,6 +328,11 @@ def main() -> int:
   features_root = Path(args.features_root) if args.features_root else default_child_or_root(collection_root, 'features')
   output_dir = Path(args.output_dir) if args.output_dir else collection_root / 'post_process' / (args.folder_name or args.action)
   output_dir.mkdir(parents=True, exist_ok=True)
+
+  manual_path = None
+  if args.manual:
+    manual_frames, manual_path = load_manual_positive_frames(collection_root, args.action)
+    setattr(args, '_manual_positive_frames', manual_frames)
 
   accumulator = {
       'positive_sum': None,
@@ -349,13 +401,18 @@ def main() -> int:
       'missing_features': missing_features,
       'flatten': args.flatten,
       'vector_formula': 'positive_mean - negative_mean',
+      'manual_positive_frames_path': None if manual_path is None else str(manual_path),
+      'manual_positive_frame_count': (
+          0 if manual_path is None
+          else sum(len(frames) for frames in getattr(args, '_manual_positive_frames', {}).values())
+      ),
       'output_files': {
           'positive_mean': str(output_dir / 'positive_mean.pt'),
           'negative_mean': str(output_dir / 'negative_mean.pt'),
           'steering_vector': str(output_dir / 'steering_vector.pt'),
           'selected_frames': str(manifest_path),
       },
-      'args': vars(args),
+      'args': {key: value for key, value in vars(args).items() if not key.startswith('_')},
   }
   (output_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
   print(json.dumps(summary, indent=2))

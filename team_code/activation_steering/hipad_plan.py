@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from activation_steering.transfuser_target_speed import TransFuserTargetSpeedAdapter
@@ -36,6 +37,27 @@ class HiPADPlanAdapter(TransFuserTargetSpeedAdapter):
             "to be lateral-neutral using the hipad-normal-* thresholds."
         ),
     )
+    parser.add_argument(
+        "--hipad-brake-use-meta-labels",
+        action="store_true",
+        help=(
+            "For brake post-processing, label positives/negatives from HiP-AD "
+            "plan_temp length instead of PID control brake/throttle."
+        ),
+    )
+    parser.add_argument("--hipad-brake-meta-temp-last-y-max", type=float, default=3.0)
+    parser.add_argument("--hipad-brake-meta-temp-path-len-max", type=float, default=4.0)
+    parser.add_argument("--hipad-brake-meta-normal-temp-last-y-min", type=float, default=8.0)
+    parser.add_argument("--hipad-brake-meta-normal-temp-path-len-min", type=float, default=8.0)
+    parser.add_argument(
+        "--hipad-brake-meta-max-plan-spat-abs-x",
+        type=float,
+        default=None,
+        help=(
+            "Optional brake meta filter: require max(abs(plan_spat[:, 0])) to be "
+            "at or below this threshold for both positives and negatives."
+        ),
+    )
 
   def augment_rows(self, rows: list[dict], log_source: Path, collection_root: Path) -> list[dict]:
     meta_dir = self._meta_dir_for_log(log_source, collection_root)
@@ -57,6 +79,8 @@ class HiPADPlanAdapter(TransFuserTargetSpeedAdapter):
   def classify_post_process_label(self, row: dict, action: str, run_name: str, args) -> str | None:
     if args.hipad_disable_plan_meta_labels:
       return None
+    if action == "brake" and args.hipad_brake_use_meta_labels:
+      return self._classify_brake_from_meta(row, args)
     if action not in ("left_change_lane", "right_change_lane"):
       return None
 
@@ -113,7 +137,7 @@ class HiPADPlanAdapter(TransFuserTargetSpeedAdapter):
     return None
 
   def filter_post_process_label(self, row: dict, label: str, action: str, run_name: str, args) -> str | None:
-    if action != "brake" or not args.hipad_brake_require_neutral_plan:
+    if action != "brake" or not args.hipad_brake_require_neutral_plan or args.hipad_brake_use_meta_labels:
       return label
     if label not in ("positive", "negative"):
       return label
@@ -162,14 +186,17 @@ class HiPADPlanAdapter(TransFuserTargetSpeedAdapter):
     try:
       plan_spat = meta["plan_spat"]
       xs = [float(point[0]) for point in plan_spat]
-      return {
+      metrics = {
           "spat_mean_x": sum(xs) / len(xs),
           "spat_first_x": xs[0],
           "spat_last_x": xs[-1],
+          "spat_max_abs_x": max(abs(x) for x in xs),
           "aim_x": float(meta["aim"][0]),
           "angle_final": float(meta.get("angle_final", meta.get("angle", 0.0))),
           "desired_speed": float(meta.get("desired_speed", 0.0)),
       }
+      metrics.update(HiPADPlanAdapter._plan_temp_metrics(meta))
+      return metrics
     except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError):
       return None
 
@@ -181,3 +208,82 @@ class HiPADPlanAdapter(TransFuserTargetSpeedAdapter):
         abs(metrics["aim_x"]) <= args.hipad_normal_aim_max and
         abs(metrics["angle_final"]) <= args.hipad_normal_angle_max
     )
+
+  @staticmethod
+  def _path_len(points: list[tuple[float, float]]) -> float:
+    prev_x = 0.0
+    prev_y = 0.0
+    total = 0.0
+    for x, y in points:
+      total += math.hypot(x - prev_x, y - prev_y)
+      prev_x = x
+      prev_y = y
+    return total
+
+  @staticmethod
+  def _plan_temp_metrics(meta: dict) -> dict:
+    plan_temp = meta.get("plan_temp")
+    if not plan_temp:
+      return {
+          "temp_path_len": None,
+          "temp_last_x": None,
+          "temp_last_y": None,
+          "temp_mean_x": None,
+          "temp_mean_y": None,
+      }
+
+    temp_points = [(float(point[0]), float(point[1])) for point in plan_temp]
+    temp_xs = [point[0] for point in temp_points]
+    temp_ys = [point[1] for point in temp_points]
+    return {
+        "temp_path_len": HiPADPlanAdapter._path_len(temp_points),
+        "temp_last_x": temp_xs[-1],
+        "temp_last_y": temp_ys[-1],
+        "temp_mean_x": sum(temp_xs) / len(temp_xs),
+        "temp_mean_y": sum(temp_ys) / len(temp_ys),
+    }
+
+  @staticmethod
+  def _plan_spat_max_abs_x(meta: dict) -> float | None:
+    plan_spat = meta.get("plan_spat")
+    if not plan_spat:
+      return None
+    xs = [float(point[0]) for point in plan_spat]
+    return max(abs(x) for x in xs)
+
+  def _classify_brake_from_meta(self, row: dict, args) -> str:
+    meta = row.get("_hipad_meta")
+    if meta is None:
+      return "skip"
+
+    try:
+      metrics = self._plan_temp_metrics(meta)
+      spat_max_abs_x = self._plan_spat_max_abs_x(meta)
+    except (IndexError, TypeError, ValueError, ZeroDivisionError):
+      return "skip"
+
+    max_spat_abs_x = args.hipad_brake_meta_max_plan_spat_abs_x
+    if max_spat_abs_x is not None:
+      if spat_max_abs_x is None or spat_max_abs_x > max_spat_abs_x:
+        return "skip"
+
+    temp_last_y = metrics["temp_last_y"]
+    temp_path_len = metrics["temp_path_len"]
+    if temp_last_y is None or temp_path_len is None:
+      return "skip"
+
+    is_brake = (
+        temp_last_y <= args.hipad_brake_meta_temp_last_y_max or
+        temp_path_len <= args.hipad_brake_meta_temp_path_len_max
+    )
+    if is_brake:
+      return "positive"
+
+    is_normal = (
+        temp_last_y >= args.hipad_brake_meta_normal_temp_last_y_min and
+        temp_path_len >= args.hipad_brake_meta_normal_temp_path_len_min
+    )
+    if is_normal:
+      return "negative"
+
+    return "skip"

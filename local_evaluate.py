@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--evaluator-fatal-grace",
         type=float,
-        default=30.0,
+        default=60.0,
         help=(
             "Seconds to wait for the evaluator to exit after a fatal watchdog/CARLA "
             "timeout appears in its logs before killing the evaluator process group."

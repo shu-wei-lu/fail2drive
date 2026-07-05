@@ -36,6 +36,15 @@ class TransFuserTargetSpeedAdapter(PlannerAdapter):
         default=2,
         help="Require at least this many consecutive brake frames in the same route log.",
     )
+    parser.add_argument(
+        "--brake-target-speed-state-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Also label frames as brake when pred_target_speed/target_speed is at "
+            "or below this threshold, even if the controller is not currently braking."
+        ),
+    )
     parser.add_argument("--normal-throttle-threshold", type=float, default=0.1)
     parser.add_argument("--min-speed", type=float, default=0.5)
     parser.add_argument("--exclude-stop-sign", action="store_true")
@@ -102,13 +111,19 @@ class TransFuserTargetSpeedAdapter(PlannerAdapter):
     if speed < args.min_speed:
       return None
 
+    target_speed = self.target_speed_for(row)
+    if args.brake_target_speed_state_threshold is not None and target_speed is not None:
+      if target_speed <= args.brake_target_speed_state_threshold:
+        if not matches_patterns(run_name, args.brake_include_pattern, args.brake_exclude_pattern):
+          return None
+        return "brake"
+
     if row.get("_raw_brake_action", brake >= args.brake_threshold):
       if not matches_patterns(run_name, args.brake_include_pattern, args.brake_exclude_pattern):
         return None
       if int(row.get("_brake_run_length", 0)) < args.brake_min_run_length:
         return None
 
-      target_speed = self.target_speed_for(row)
       if target_speed is not None:
         speed_drop = speed - target_speed
         speed_ratio = speed / max(target_speed, 1e-6)

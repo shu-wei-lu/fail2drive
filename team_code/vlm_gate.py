@@ -821,6 +821,8 @@ class AsyncVLMGate:
   @classmethod
   def _command_to_action(cls, command: str) -> str:
     normalized = re.sub(r"[^a-z_]+", "", command.lower())
+    if normalized in ("brake_weak", "brakeweak", "weak_brake", "weakbrake", "gentle_brake", "gentlebrake"):
+      return "brake_weak"
     if normalized in ("stop", "brake", "yield", "emergency_brake", "emergencybrake"):
       return "brake"
     if normalized in ("l_change", "lchange", "left", "left_change", "leftchange", "change_lane_left", "changelaneleft"):

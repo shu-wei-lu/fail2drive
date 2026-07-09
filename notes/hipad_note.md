@@ -54,8 +54,8 @@ export PDM_ORACLE_ALPHA=1.0
 export PDM_ORACLE_TRIGGER_DISTANCE=20
 export PDM_ORACLE_HOLD_FRAMES=30
 export PDM_ORACLE_COOLDOWN_FRAMES=40
-export PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=70
-export PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE=90
+export PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=80
+export PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE=100
 export PDM_ORACLE_SIDE_HAZARD_DISTANCE=25
 export PDM_ORACLE_SIDE_HAZARD_TWO_WAY_DISTANCE=10
 export PDM_ORACLE_ROADBLOCKED_DISTANCE=40
@@ -63,7 +63,7 @@ export PDM_ORACLE_PRIORITY_DISTANCE=50
 export PDM_ORACLE_YIELD_EMERGENCY_DISTANCE=50
 export PDM_ORACLE_GENERAL_BRAKE=0
 
-export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad/post_process/brake_strong/steering_vector.pt,$F2D/steering/hipad/post_process/left_change_lane_meta/steering_vector.pt,$F2D/steering/hipad/post_process/right_change_lane_meta/steering_vector.pt"
+export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad_new/post_process/Brake/steering_vector.pt,$F2D/steering/hipad_new/post_process/Left/steering_vector.pt,$F2D/steering/hipad_new/post_process/Right/steering_vector.pt"
 
 export BRAKE_ACTIVATION_ALPHA_SCALE=2.0
 export LEFT_ACTIVATION_ALPHA_SCALE=1.0

@@ -78,6 +78,9 @@ class VLMPolicy(ActivationPolicy):
     # Keep the old constructor arguments accepted so existing launch scripts do
     # not fail, but do not map VLM scores into fractional alphas anymore.
     self.ttl_frames = int(decay_frames if ttl_frames is None else ttl_frames)
+    self.brake_alpha = float(os.environ.get("VLM_BRAKE_ALPHA", 2.0))
+    self.weak_brake_alpha = float(os.environ.get("VLM_WEAK_BRAKE_ALPHA", 0.5))
+    self.lateral_alpha = float(os.environ.get("VLM_LATERAL_ALPHA", 1.0))
 
   def alpha(self, frame: int, vlm_decision=None, decision_age_frames=None) -> list[float]:
     alpha_vector = [0.0 for _ in self.ACTIONS]
@@ -87,12 +90,21 @@ class VLMPolicy(ActivationPolicy):
       return alpha_vector
 
     action = self._decision_action(vlm_decision)
-    if action not in self.ACTION_INDEX:
+    if action == "brake_weak":
+      action_index = self.ACTION_INDEX["brake"]
+    elif action in self.ACTION_INDEX:
+      action_index = self.ACTION_INDEX[action]
+    else:
       return alpha_vector
     if getattr(vlm_decision, "steering_alpha", 0.0) <= 0.0 and not getattr(vlm_decision, "enable_steering", False):
       return alpha_vector
 
-    alpha_vector[self.ACTION_INDEX[action]] = 2.0 if action == "brake" else 1.0
+    if action == "brake":
+      alpha_vector[action_index] = self.brake_alpha
+    elif action == "brake_weak":
+      alpha_vector[action_index] = self.weak_brake_alpha
+    else:
+      alpha_vector[action_index] = self.lateral_alpha
     return alpha_vector
 
   @classmethod
@@ -101,6 +113,8 @@ class VLMPolicy(ActivationPolicy):
     if action is None:
       return "brake" if getattr(vlm_decision, "steering_alpha", 0.0) > 0.0 else None
     normalized = str(action).strip().lower()
+    if normalized in ("brake_weak", "brakeweak", "weak_brake", "weakbrake", "gentle_brake", "gentlebrake"):
+      return "brake_weak"
     if normalized in ("brake", "stop", "yield", "emergency_brake", "emergencybrake"):
       return "brake"
     if normalized in ("left", "l_change", "left_change", "left_change_lane", "change_lane_left"):
@@ -345,6 +359,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
       roadblocked_distance: float = 40.0,
       priority_distance: float = 50.0,
       yield_emergency_distance: float = 50.0,
+      parking_exit_left: bool = True,
+      parking_exit_distance_to_driving_lane: float = 2.0,
+      parking_exit_clear_front_distance: float = 25.0,
+      parking_exit_clear_rear_distance: float = 8.0,
       general_brake: bool = False,
   ):
     super().__init__(
@@ -371,6 +389,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     self.roadblocked_distance = float(roadblocked_distance)
     self.priority_distance = float(priority_distance)
     self.yield_emergency_distance = float(yield_emergency_distance)
+    self.parking_exit_left = bool(parking_exit_left)
+    self.parking_exit_distance_to_driving_lane = float(parking_exit_distance_to_driving_lane)
+    self.parking_exit_clear_front_distance = float(parking_exit_clear_front_distance)
+    self.parking_exit_clear_rear_distance = float(parking_exit_clear_rear_distance)
     self.general_brake = bool(general_brake)
 
   @classmethod
@@ -411,6 +433,11 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         roadblocked_distance=float(os.environ.get("PDM_ORACLE_ROADBLOCKED_DISTANCE", 40.0)),
         priority_distance=float(os.environ.get("PDM_ORACLE_PRIORITY_DISTANCE", 50.0)),
         yield_emergency_distance=float(os.environ.get("PDM_ORACLE_YIELD_EMERGENCY_DISTANCE", 50.0)),
+        parking_exit_left=_strtobool(os.environ.get("PDM_ORACLE_PARKING_EXIT_LEFT", "1")),
+        parking_exit_distance_to_driving_lane=float(
+            os.environ.get("PDM_ORACLE_PARKING_EXIT_DISTANCE_TO_DRIVING_LANE", 2.0)),
+        parking_exit_clear_front_distance=float(os.environ.get("PDM_ORACLE_PARKING_EXIT_CLEAR_FRONT_DISTANCE", 1.0)),
+        parking_exit_clear_rear_distance=float(os.environ.get("PDM_ORACLE_PARKING_EXIT_CLEAR_REAR_DISTANCE", 0.0)),
         general_brake=_strtobool(os.environ.get("PDM_ORACLE_GENERAL_BRAKE")),
     )
 
@@ -446,7 +473,15 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         actor_id = getattr(actor, "id", None)
         triggers.append((action, scenario_type, actor_id, distance))
 
-    if triggers or not self.general_brake:
+    if triggers:
+      return triggers
+
+    parking_exit_trigger = self._general_parking_exit_left_trigger(ego, CarlaDataProvider)
+    if parking_exit_trigger is not None and self._action_allowed("left"):
+      triggers.append(parking_exit_trigger)
+      return triggers
+
+    if not self.general_brake:
       return triggers
 
     brake_actor = self._general_brake_actor(ego, CarlaDataProvider)
@@ -631,6 +666,124 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     actor_side = "right" if lateral > 0.0 else "left"
     direction = self._scenario_direction(scenario_data)
     return direction is None or direction == actor_side
+
+  def _general_parking_exit_left_trigger(self, ego, data_provider):
+    if not self.parking_exit_left:
+      return None
+
+    world_map = self._get_map(data_provider)
+    if world_map is None:
+      return None
+
+    ego_location = ego.get_location()
+    ego_waypoint = self._get_waypoint_any(world_map, ego_location)
+    if ego_waypoint is None:
+      return None
+
+    driving_waypoint = self._get_waypoint_driving(world_map, ego_location)
+    distance_to_driving_lane = 0.0
+    if driving_waypoint is not None:
+      distance_to_driving_lane = self._horizontal_distance(ego_location, driving_waypoint.transform.location)
+
+    parking_exit_like = (
+        not self._waypoint_is_driving(ego_waypoint) or
+        distance_to_driving_lane > self.parking_exit_distance_to_driving_lane)
+    if not parking_exit_like:
+      return None
+
+    target_lane = self._left_driving_lane(ego_waypoint)
+    if target_lane is None and driving_waypoint is not None:
+      target_lane = driving_waypoint
+    if target_lane is None:
+      return None
+
+    if not self._lane_clear(
+        ego,
+        target_lane,
+        data_provider,
+        front_distance=self.parking_exit_clear_front_distance,
+        rear_distance=self.parking_exit_clear_rear_distance,
+    ):
+      return None
+
+    return ("left", "GeneralParkingExitLeft", None, distance_to_driving_lane)
+
+  def _lane_clear(self, ego, target_lane, data_provider, front_distance: float, rear_distance: float) -> bool:
+    world_map = self._get_map(data_provider)
+    if world_map is None:
+      return False
+
+    lane_keys = self._collect_lane_keys(target_lane, max(front_distance, rear_distance))
+    if not lane_keys:
+      return False
+
+    ego_location = ego.get_location()
+    ego_forward = ego.get_transform().get_forward_vector()
+    ego_id = getattr(ego, "id", None)
+
+    for vehicle in self._vehicle_actors(data_provider):
+      if getattr(vehicle, "id", None) == ego_id or not getattr(vehicle, "is_alive", True):
+        continue
+      vehicle_waypoint = self._get_waypoint_any(world_map, vehicle.get_location())
+      if vehicle_waypoint is None:
+        continue
+      if (vehicle_waypoint.road_id, vehicle_waypoint.lane_id) not in lane_keys:
+        continue
+
+      vehicle_location = vehicle.get_location()
+      diff = vehicle_location - ego_location
+      longitudinal = diff.x * ego_forward.x + diff.y * ego_forward.y
+      if -rear_distance <= longitudinal <= front_distance:
+        return False
+    return True
+
+  @staticmethod
+  def _get_waypoint_any(world_map, location):
+    try:
+      import carla  # pylint: disable=import-outside-toplevel
+      lane_type = getattr(carla.LaneType, "Any", None)
+      if lane_type is None and hasattr(carla, "libcarla"):
+        lane_type = getattr(carla.libcarla.LaneType, "Any", None)
+      if lane_type is not None:
+        return world_map.get_waypoint(location, lane_type=lane_type)
+    except Exception:
+      pass
+    try:
+      return world_map.get_waypoint(location)
+    except Exception:
+      return None
+
+  @staticmethod
+  def _get_waypoint_driving(world_map, location):
+    try:
+      import carla  # pylint: disable=import-outside-toplevel
+      return world_map.get_waypoint(location, lane_type=carla.LaneType.Driving)
+    except Exception:
+      try:
+        return world_map.get_waypoint(location)
+      except Exception:
+        return None
+
+  @classmethod
+  def _waypoint_is_driving(cls, waypoint) -> bool:
+    try:
+      import carla  # pylint: disable=import-outside-toplevel
+      return waypoint.lane_type == carla.LaneType.Driving
+    except Exception:
+      return "Driving" in str(getattr(waypoint, "lane_type", ""))
+
+  def _left_driving_lane(self, waypoint):
+    current = waypoint
+    for _ in range(4):
+      try:
+        current = current.get_left_lane()
+      except Exception:
+        return None
+      if current is None:
+        return None
+      if self._waypoint_is_driving(current):
+        return current
+    return None
 
   def _general_brake_actor(self, ego, data_provider):
     for actor in self._vehicle_actors(data_provider) + self._walker_actors(data_provider):

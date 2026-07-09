@@ -21,6 +21,12 @@ import numpy as np
 from PIL import Image
 import torch
 
+from alpamayo_native_command import (
+    TrajectoryCommandConfig,
+    derive_command_from_cot,
+    derive_command_from_pred_xyz,
+)
+
 
 def _strtobool(value: str | None) -> bool:
   return str(value).lower() in ("1", "true", "t", "yes", "y", "on")
@@ -55,6 +61,22 @@ class AlpamayoVLM:
     self.vqa_temperature = args.vqa_temperature
     self.vqa_num_samples = args.vqa_num_samples
     self.raw_output_only = args.raw_output_only
+    self.decision_mode = args.decision_mode
+    self.native_num_traj_samples = args.native_num_traj_samples
+    self.native_top_p = args.native_top_p
+    self.native_temperature = args.native_temperature
+    self.native_use_nav = args.native_use_nav
+    self.cot_speed_mode = args.cot_speed_mode
+    self.cot_lateral_mode = args.cot_lateral_mode
+    self.cot_weak_brake_mode = args.cot_weak_brake_mode
+    self.native_command_config = TrajectoryCommandConfig(
+        horizon_s=args.native_horizon_s,
+        brake_max_avg_speed=args.native_brake_max_avg_speed,
+        brake_max_forward=args.native_brake_max_forward,
+        lateral_threshold=args.native_lateral_threshold,
+        lateral_deadband_forward=args.native_lateral_deadband_forward,
+        left_is_negative_y=not args.native_left_is_positive_y,
+    )
 
     dtype = self._resolve_dtype(args.dtype)
     if self.version == "1.5":
@@ -102,6 +124,8 @@ class AlpamayoVLM:
       return self._generate_v15(
           images=images,
           max_new_tokens=max_new_tokens,
+          ego_history_xyz=ego_history_xyz,
+          ego_history_rot=ego_history_rot,
           speed=speed,
           command=command,
           target_point=target_point,
@@ -183,10 +207,23 @@ class AlpamayoVLM:
   def _generate_v15(self,
                     images: list[Image.Image],
                     max_new_tokens: int | None = None,
+                    ego_history_xyz=None,
+                    ego_history_rot=None,
                     speed=None,
                     command=None,
                     target_point=None,
                     image_frame_ids=None) -> dict:
+    if self.decision_mode in ("native_traj", "native_cot"):
+      return self._generate_v15_native_traj(
+          images=images,
+          max_new_tokens=max_new_tokens,
+          ego_history_xyz=ego_history_xyz,
+          ego_history_rot=ego_history_rot,
+          command=command,
+          image_frame_ids=image_frame_ids)
+    if self.decision_mode != "vqa":
+      raise ValueError(f"Unsupported Alpamayo 1.5 decision mode: {self.decision_mode}")
+
     frames = torch.stack([self._pil_to_chw_tensor(image) for image in images], dim=0)
     camera_indices = torch.tensor([1], dtype=torch.int64)
     question = self._v15_question(
@@ -236,6 +273,78 @@ class AlpamayoVLM:
     decision["question"] = question
     decision["raw_response"] = raw_response
     decision["raw_generate_text_output"] = self._jsonable(extra)
+    return decision
+
+  def _generate_v15_native_traj(self,
+                                images: list[Image.Image],
+                                max_new_tokens: int | None = None,
+                                ego_history_xyz=None,
+                                ego_history_rot=None,
+                                command=None,
+                                image_frame_ids=None) -> dict:
+    frames = torch.stack([self._pil_to_chw_tensor(image) for image in images], dim=0)
+    camera_indices = torch.tensor([1], dtype=torch.int64)
+    nav_text = self._native_nav_text(command) if self.native_use_nav else None
+    messages = self.helper.create_message(
+        frames,
+        camera_indices=camera_indices,
+        num_frames_per_camera=len(images),
+        nav_text=nav_text,
+        use_nav_prompt=nav_text is None)
+    inputs = self.processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        continue_final_message=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    ego_history_xyz, ego_history_rot = self._ego_history_or_stationary(ego_history_xyz, ego_history_rot)
+    model_inputs = {
+        "tokenized_data": inputs,
+        "ego_history_xyz": ego_history_xyz,
+        "ego_history_rot": ego_history_rot,
+    }
+    model_inputs = self.helper.to_device(model_inputs, self.device)
+
+    with torch.inference_mode():
+      if self.device != "cpu" and str(self.device).startswith("cuda"):
+        autocast_ctx = torch.autocast("cuda", dtype=self._resolve_dtype("bfloat16"))
+      else:
+        autocast_ctx = contextlib.nullcontext()
+      with autocast_ctx:
+        pred_xyz, pred_rot, extra = self.model.sample_trajectories_from_data_with_vlm_rollout(
+            data=model_inputs,
+            top_p=self.native_top_p,
+            temperature=self.native_temperature,
+            num_traj_samples=self.native_num_traj_samples,
+            max_generation_length=int(max_new_tokens or self.max_new_tokens),
+            return_extra=True)
+
+    traj_decision = derive_command_from_pred_xyz(pred_xyz, self.native_command_config)
+    cot = self._first_nonempty_text(extra, ("cot", "meta_action", "answer"))
+    if self.decision_mode == "native_cot":
+      decision = derive_command_from_cot(
+          cot,
+          speed_mode=self.cot_speed_mode,
+          lateral_mode=self.cot_lateral_mode,
+          weak_brake_mode=self.cot_weak_brake_mode)
+      decision["trajectory_action"] = traj_decision.get("action", "none")
+      decision["trajectory_reason"] = traj_decision.get("reason", "")
+      decision["trajectory_metrics"] = traj_decision.get("trajectory_metrics", {})
+      decision["trajectory_preview_xy"] = traj_decision.get("trajectory_preview_xy", [])
+    else:
+      decision = traj_decision
+    raw_response = (
+        f"decision_mode={self.decision_mode} nav_text={nav_text!r} "
+        f"image_frame_ids={image_frame_ids} cot={cot}"
+    )
+    decision["raw_response"] = raw_response
+    decision["cot"] = cot
+    decision["nav_text"] = nav_text
+    decision["raw_extra"] = self._jsonable(extra)
+    decision["pred_xyz_shape"] = list(pred_xyz.shape)
+    decision["pred_rot_shape"] = list(pred_rot.shape)
     return decision
 
   def _messages(self, images: list[Image.Image], prompt: str):
@@ -327,6 +436,13 @@ class AlpamayoVLM:
         5: "change lane left",
         6: "change lane right",
     }.get(command, "follow lane")
+
+  @staticmethod
+  def _native_nav_text(command) -> str:
+    intent = AlpamayoVLM._navigation_intent(command)
+    if intent == "unknown":
+      return "Follow the route safely."
+    return intent.capitalize() + "."
 
   @staticmethod
   def _format_target_point(target_point) -> str:
@@ -630,7 +746,7 @@ class Handler(BaseHTTPRequestHandler):
           f"[AlpamayoServer] request frame_id={frame_id} "
           f"image_frame_ids={image_frame_ids} num_images={len(images)} "
           f"history={'real' if ego_history_xyz is not None and ego_history_rot is not None else 'stationary'} "
-          f"mode={'vqa_native' if self.model.version == '1.5' else 'trajectory_prompt'} "
+          f"mode={self.model.decision_mode if self.model.version == '1.5' else 'trajectory_prompt'} "
           f"prompt_chars={len(str(payload.get('prompt', '')))}",
           flush=True)
       result = self.model.generate(
@@ -707,6 +823,10 @@ class Handler(BaseHTTPRequestHandler):
         "ego_history_xyz": payload.get("ego_history_xyz"),
         "ego_history_rot": payload.get("ego_history_rot"),
         "alpamayo_version": self.model.version if self.model is not None else None,
+        "decision_mode": self.model.decision_mode if self.model is not None else None,
+        "cot_speed_mode": self.model.cot_speed_mode if self.model is not None else None,
+        "cot_lateral_mode": self.model.cot_lateral_mode if self.model is not None else None,
+        "cot_weak_brake_mode": self.model.cot_weak_brake_mode if self.model is not None else None,
     }
     (request_dir / "request.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -746,6 +866,68 @@ def parse_args():
   parser.add_argument("--vqa-top-p", type=float, default=float(os.environ.get("ALPAMAYO_VQA_TOP_P", 0.98)))
   parser.add_argument("--vqa-temperature", type=float, default=float(os.environ.get("ALPAMAYO_VQA_TEMPERATURE", 0.6)))
   parser.add_argument("--vqa-num-samples", type=int, default=int(os.environ.get("ALPAMAYO_VQA_NUM_SAMPLES", 1)))
+  parser.add_argument(
+      "--decision-mode",
+      choices=("vqa", "native_traj", "native_cot"),
+      default=os.environ.get("ALPAMAYO_DECISION_MODE", "vqa"),
+      help="For Alpamayo 1.5, choose VQA text, native trajectory, or native CoT-derived command.")
+  parser.add_argument(
+      "--native-num-traj-samples",
+      type=int,
+      default=int(os.environ.get("ALPAMAYO_NATIVE_NUM_TRAJ_SAMPLES", 1)))
+  parser.add_argument(
+      "--native-top-p",
+      type=float,
+      default=float(os.environ.get("ALPAMAYO_NATIVE_TOP_P", os.environ.get("ALPAMAYO_VQA_TOP_P", 0.98))))
+  parser.add_argument(
+      "--native-temperature",
+      type=float,
+      default=float(os.environ.get("ALPAMAYO_NATIVE_TEMPERATURE", os.environ.get("ALPAMAYO_VQA_TEMPERATURE", 0.6))))
+  parser.add_argument(
+      "--native-use-nav",
+      action="store_true",
+      default=_strtobool(os.environ.get("ALPAMAYO_NATIVE_USE_NAV", "1")),
+      help="Condition native trajectory generation on the CARLA route command as nav text.")
+  parser.add_argument(
+      "--native-horizon-s",
+      type=float,
+      default=float(os.environ.get("ALPAMAYO_NATIVE_HORIZON_S", 6.4)))
+  parser.add_argument(
+      "--native-brake-max-avg-speed",
+      type=float,
+      default=float(os.environ.get("ALPAMAYO_NATIVE_BRAKE_MAX_AVG_SPEED", 1.0)))
+  parser.add_argument(
+      "--native-brake-max-forward",
+      type=float,
+      default=float(os.environ.get("ALPAMAYO_NATIVE_BRAKE_MAX_FORWARD", 3.0)))
+  parser.add_argument(
+      "--native-lateral-threshold",
+      type=float,
+      default=float(os.environ.get("ALPAMAYO_NATIVE_LATERAL_THRESHOLD", 1.0)))
+  parser.add_argument(
+      "--native-lateral-deadband-forward",
+      type=float,
+      default=float(os.environ.get("ALPAMAYO_NATIVE_LATERAL_DEADBAND_FORWARD", 2.0)))
+  parser.add_argument(
+      "--native-left-is-positive-y",
+      action="store_true",
+      default=_strtobool(os.environ.get("ALPAMAYO_NATIVE_LEFT_IS_POSITIVE_Y", "0")),
+      help="Flip left/right derivation if Alpamayo ego-frame +Y means left in your setup.")
+  parser.add_argument(
+      "--cot-speed-mode",
+      choices=("loose", "strict"),
+      default=os.environ.get("ALPAMAYO_COT_SPEED_MODE", "loose"),
+      help="In native_cot mode, loose maps keep/maintain distance to brake; strict only maps explicit stop/brake/slow/yield.")
+  parser.add_argument(
+      "--cot-lateral-mode",
+      choices=("loose", "strict"),
+      default=os.environ.get("ALPAMAYO_COT_LATERAL_MODE", "loose"),
+      help="In native_cot mode, strict only allows lateral actions when the CoT says the ego lane/path is blocked or encroached.")
+  parser.add_argument(
+      "--cot-weak-brake-mode",
+      choices=("none", "distance", "hazard", "distance_animal"),
+      default=os.environ.get("ALPAMAYO_COT_WEAK_BRAKE_MODE", "none"),
+      help="In native_cot mode, map selected soft CoT hazard/distance phrases to brake_weak instead of none.")
   parser.add_argument(
       "--raw-log-path",
       default=os.environ.get(

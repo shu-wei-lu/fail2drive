@@ -42,6 +42,24 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument('--collection-root', default='results/steering_features')
   parser.add_argument('--logs-root', default=None, help='Defaults to <collection-root>/logs.')
   parser.add_argument('--features-root', default=None, help='Defaults to <collection-root>/features.')
+  parser.add_argument(
+      '--feature-name',
+      '--feature_name',
+      default=None,
+      help=(
+          'Optional nested feature name under each run, e.g. align_query for '
+          '<features-root>/<run>/<feature-name>/<layer-name>/<frame>.pt.'
+      ),
+  )
+  parser.add_argument(
+      '--layer-name',
+      '--layer_name',
+      default=None,
+      help=(
+          'Optional nested layer name under each feature name, e.g. layer_02 for '
+          '<features-root>/<run>/<feature-name>/<layer-name>/<frame>.pt.'
+      ),
+  )
   parser.add_argument('--output-dir', default=None, help='Defaults to <collection-root>/post_process.')
   parser.add_argument(
       '--folder-name',
@@ -118,16 +136,61 @@ def action_dir_name(action: str) -> str:
   if action == 'brake':
     return 'Brake'
   if action == 'left_change_lane':
-    return 'Left'
+    return 'LaneChangeLeft'
   if action == 'right_change_lane':
-    return 'Right'
+    return 'LaneChangeRight'
   return action
 
 
-def load_manual_positive_frames(collection_root: Path, action: str) -> tuple[dict[str, set[int]], Path]:
-  path = collection_root / action_dir_name(action) / 'picked_frames.json'
-  if not path.exists():
-    raise FileNotFoundError(f'--manual expected picked frames at {path}')
+def manual_action_dir_candidates(action: str) -> list[str]:
+  candidates = [action_dir_name(action)]
+  if action == 'left_change_lane':
+    candidates.append('Left')
+  elif action == 'right_change_lane':
+    candidates.append('Right')
+  return candidates
+
+
+def manual_positive_frame_path(
+    collection_root: Path,
+    action: str,
+    include_patterns: list[str],
+) -> Path:
+  candidates: list[Path] = []
+  for dirname in manual_action_dir_candidates(action):
+    candidates.append(collection_root / dirname / 'picked_frames.json')
+
+  for pattern in include_patterns:
+    candidates.append(collection_root / pattern / 'picked_frames.json')
+
+  for path in candidates:
+    if path.exists():
+      return path
+
+  matching_paths = []
+  for path in sorted(collection_root.glob('*/picked_frames.json')):
+    match_context = f'{path.parent.name}\n{path.parent}'
+    if matches_patterns(match_context, include_patterns, []):
+      matching_paths.append(path)
+
+  if len(matching_paths) == 1:
+    return matching_paths[0]
+  if len(matching_paths) > 1:
+    shown = ', '.join(str(path) for path in matching_paths)
+    raise ValueError(
+        f'--manual matched multiple picked_frames.json files: {shown}. '
+        'Use a more specific --positive-include-pattern.')
+
+  searched = ', '.join(str(path) for path in candidates)
+  raise FileNotFoundError(f'--manual expected picked frames at one of: {searched}')
+
+
+def load_manual_positive_frames(
+    collection_root: Path,
+    action: str,
+    include_patterns: list[str],
+) -> tuple[dict[str, set[int]], Path]:
+  path = manual_positive_frame_path(collection_root, action, include_patterns)
 
   with path.open('r', encoding='utf-8') as f:
     raw = json.load(f)
@@ -174,27 +237,88 @@ def match_context_for(log_source: Path, run_name: str) -> str:
   return f'{run_name}\n{log_source}\n{log_source.parent}'
 
 
-def feature_file_in_dir(feature_dir: Path, frame: int, model_index: int) -> Path:
+def feature_search_root(feature_dir: Path, model_index: int) -> Path:
   model_dir = feature_dir / f'model_{model_index:02d}'
   if model_dir.exists():
-    feature_dir = model_dir
-  return feature_dir / f'{frame:06d}.pt'
+    return model_dir
+  return feature_dir
 
 
-def sibling_feature_path_for(log_source: Path, run_name: str, model_index: int, frame: int) -> Path | None:
+def feature_file_in_dir(feature_dir: Path, frame: int, model_index: int) -> Path:
+  return feature_search_root(feature_dir, model_index) / f'{frame:06d}.pt'
+
+
+def nested_feature_files_in_dir(
+    feature_dir: Path,
+    frame: int,
+    model_index: int,
+    feature_name: str | None,
+    layer_name: str | None,
+) -> list[Path]:
+  search_root = feature_search_root(feature_dir, model_index)
+  filename = f'{frame:06d}.pt'
+
+  if feature_name and layer_name:
+    return [search_root / feature_name / layer_name / filename]
+  if feature_name:
+    return sorted(path for path in (search_root / feature_name).glob(f'*/{filename}') if path.is_file())
+  if layer_name:
+    return sorted(path for path in search_root.glob(f'*/{layer_name}/{filename}') if path.is_file())
+  return sorted(path for path in search_root.glob(f'*/*/{filename}') if path.is_file())
+
+
+def feature_path_in_run_dir(
+    feature_dir: Path,
+    frame: int,
+    model_index: int,
+    feature_name: str | None,
+    layer_name: str | None,
+) -> Path | None:
+  path = feature_file_in_dir(feature_dir, frame, model_index)
+  if path.exists():
+    return path
+
+  candidates = [path for path in nested_feature_files_in_dir(
+      feature_dir, frame, model_index, feature_name, layer_name) if path.exists()]
+  if len(candidates) == 1:
+    return candidates[0]
+  if len(candidates) > 1:
+    shown = ', '.join(str(path) for path in candidates[:5])
+    suffix = '' if len(candidates) <= 5 else f', ... ({len(candidates)} total)'
+    raise ValueError(
+        f'Multiple feature files found for frame {frame:06d} under {feature_dir}: '
+        f'{shown}{suffix}. Pass --feature-name and --layer-name to choose one.')
+  return None
+
+
+def sibling_feature_path_for(
+    log_source: Path,
+    run_name: str,
+    model_index: int,
+    frame: int,
+    feature_name: str | None,
+    layer_name: str | None,
+) -> Path | None:
   log_dir = log_source.parent if log_source.name == 'activation_actions.jsonl' else log_source
   if log_dir.parent.name != 'logs':
     return None
-  path = feature_file_in_dir(log_dir.parent.parent / 'features' / run_name, frame, model_index)
-  return path if path.exists() else None
+  return feature_path_in_run_dir(
+      log_dir.parent.parent / 'features' / run_name, frame, model_index, feature_name, layer_name)
 
 
-def nested_feature_path_for(features_root: Path, run_name: str, model_index: int, frame: int) -> Path | None:
+def nested_feature_path_for(
+    features_root: Path,
+    run_name: str,
+    model_index: int,
+    frame: int,
+    feature_name: str | None,
+    layer_name: str | None,
+) -> Path | None:
   for feature_dir in sorted(features_root.rglob(run_name)):
     if not feature_dir.is_dir():
       continue
-    path = feature_file_in_dir(feature_dir, frame, model_index)
-    if path.exists():
+    path = feature_path_in_run_dir(feature_dir, frame, model_index, feature_name, layer_name)
+    if path is not None:
       return path
   return None
 
@@ -206,11 +330,13 @@ def feature_path_for(row: dict, log_source: Path, logs_root: Path, features_root
 
   run_name = run_name_for(log_source)
   frame = int(row['frame'])
-  sibling_path = sibling_feature_path_for(log_source, run_name, args.model_index, frame)
+  sibling_path = sibling_feature_path_for(
+      log_source, run_name, args.model_index, frame, args.feature_name, args.layer_name)
   if sibling_path is not None:
     return sibling_path
 
-  nested_path = nested_feature_path_for(features_root, run_name, args.model_index, frame)
+  nested_path = nested_feature_path_for(
+      features_root, run_name, args.model_index, frame, args.feature_name, args.layer_name)
   if nested_path is not None:
     return nested_path
 
@@ -331,7 +457,8 @@ def main() -> int:
 
   manual_path = None
   if args.manual:
-    manual_frames, manual_path = load_manual_positive_frames(collection_root, args.action)
+    manual_frames, manual_path = load_manual_positive_frames(
+        collection_root, args.action, args.positive_include_pattern)
     setattr(args, '_manual_positive_frames', manual_frames)
 
   accumulator = {

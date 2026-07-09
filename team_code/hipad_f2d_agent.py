@@ -215,9 +215,9 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             return 0.0
         direction = cls._infer_scalar_activation_direction()
         # if direction == "left":
-        #     return -1.5
+        #     return -1.6
         # if direction == "right":
-        #     return 1.5
+        #     return 1.6
         return 0.0
 
     @staticmethod
@@ -229,9 +229,9 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         if left_alpha == 0.0 and right_alpha == 0.0:
             return 0.0
         # if right_alpha > left_alpha:
-        #     return 1.5
+        #     return 1.6
         # if left_alpha > right_alpha:
-        #     return -1.5
+        #     return -1.6
         return 0.0
 
     @classmethod

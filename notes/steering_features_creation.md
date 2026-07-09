@@ -150,6 +150,10 @@ The vector formula is `positive_mean - negative_mean`.
 ## Post Process HiP-AD
 
 Use the `hipad_plan` adapter for HiP-AD. For lane-change actions, this adapter uses `images/<run>/metas/*.json` rather than only `activation_actions.jsonl`.
+For newer HiP-AD runs that save multiple tensors under
+`features/<run>/<feature-name>/<layer-name>/<frame>.pt`, choose the tensor with
+`--feature-name` and `--layer-name`. Older runs that save directly under
+`features/<run>/<frame>.pt` keep working without these flags.
 
 The lane-change positive rule is based on planning intention:
 
@@ -185,6 +189,8 @@ python post_process_steering_features.py \
   --collection-root steering/hipad \
   --output-dir steering/hipad/post_process/brake \
   --action brake \
+  --feature-name align_query \
+  --layer-name layer_02 \
   --positive-include-pattern Brake \
   --negative-include-pattern Normal \
   --hipad-brake-require-neutral-plan
@@ -194,6 +200,8 @@ python post_process_steering_features.py \
   --collection-root steering/hipad \
   --output-dir steering/hipad/post_process/left_change_lane_meta \
   --action left_change_lane \
+  --feature-name align_query \
+  --layer-name layer_02 \
   --positive-include-pattern LaneChangeLeft \
   --negative-include-pattern Normal
 
@@ -202,6 +210,8 @@ python post_process_steering_features.py \
   --collection-root steering/hipad \
   --output-dir steering/hipad/post_process/right_change_lane_meta \
   --action right_change_lane \
+  --feature-name align_query \
+  --layer-name layer_02 \
   --positive-include-pattern LaneChangeRight \
   --negative-include-pattern Normal
 ```
@@ -214,6 +224,8 @@ python post_process_steering_features.py \
   --collection-root steering/hipad \
   --output-dir steering/hipad/post_process/left_change_lane_meta_fast_aim \
   --action left_change_lane \
+  --feature-name align_query \
+  --layer-name layer_02 \
   --positive-include-pattern LaneChangeLeft \
   --negative-include-pattern Normal \
   --hipad-plan-aim-threshold 0.4 \

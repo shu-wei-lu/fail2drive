@@ -38,7 +38,7 @@ def bash_file(job, cfg, carla_world_port_start, carla_streaming_port_start, carl
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=12gb
+#SBATCH --mem=16gb
 #SBATCH --time=2:00:00
 #SBATCH --gres=gpu:nvidia_geforce_rtx_4090:1
 # NOTE: Partition and gres likely need to be updated for your cluster
@@ -46,6 +46,7 @@ def bash_file(job, cfg, carla_world_port_start, carla_streaming_port_start, carl
 # NOTE: Make sure that the time limit is enough for your model to fail the route!
 # Example: Timeout may take 3-4 minutes in game time, if cluster time limit enables only 2:30 game time, the route will be resubmitted until it succeeds!
 
+echo 'HPC Node Name:' $(hostname)
 echo JOB ID $SLURM_JOB_ID
 
 # NOTE: You can use this in your agent to store visualization outputs
@@ -194,7 +195,7 @@ if __name__ == "__main__":
                       help='Path where results should be stored')
     parser.add_argument('--seeds', nargs='+', type=int, default=[1, 2, 3],
                       help='The seeds to evaluate')
-    parser.add_argument('--retries', type=int, default=3,
+    parser.add_argument('--retries', type=int, default=2,
                       help='Maximum number of retries per route')
     parser.add_argument('--lb_script', type=str,
                       default='leaderboard/leaderboard/leaderboard_evaluator.py',

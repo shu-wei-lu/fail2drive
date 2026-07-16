@@ -176,28 +176,73 @@ class _BaseOraclePolicy(ActivationPolicy):
     if self.fixed_alpha <= 0.0:
       return alpha_vector
 
-    for action_index in range(len(self.ACTIONS)):
-      if frame <= self._active_until[action_index]:
-        alpha_vector[action_index] = self.fixed_alpha
-
-    if any(value > 0.0 for value in alpha_vector):
-      return alpha_vector
-
     triggers = self._oracle_triggers()
-    if not triggers:
+    selected = self._select_triggers(triggers) if triggers else []
+
+    # Braking is a live safety decision, not a lane-change maneuver.  Recheck
+    # it every frame so an obstacle that remains in the ego path cannot fall
+    # into brake cooldown.  A live brake also interrupts any held lateral
+    # action; otherwise a previous lane-change activation could persist into a
+    # newly hazardous situation.
+    brake_trigger = next((trigger for trigger in selected if trigger[0] == "brake"), None)
+    lateral_hold_active = any(
+        frame <= self._active_until[self.ACTION_INDEX[action]] for action in ("left", "right")
+    )
+    if (
+        brake_trigger is not None and
+        lateral_hold_active and
+        brake_trigger[1] in getattr(self, "TWO_WAY_LATERAL_SCENARIOS", frozenset())
+    ):
+      # Once a two-way detour has been declared clear and its lateral action
+      # is underway, do not let a transient re-evaluation of that same class
+      # cancel the maneuver mid-hold.  Other live safety brakes (for example
+      # pedestrians or road blocks) retain priority over lateral steering.
+      brake_trigger = None
+    brake_index = self.ACTION_INDEX["brake"]
+    if brake_trigger is not None:
+      for action in ("left", "right"):
+        action_index = self.ACTION_INDEX[action]
+        self._active_until[action_index] = -1
+        self._cooldown_until[action_index] = -1
+      self._active_until[brake_index] = frame
+      self._cooldown_until[brake_index] = frame
+      alpha_vector[brake_index] = self.fixed_alpha
+      self._log_trigger(frame, *brake_trigger)
       return alpha_vector
 
-    selected = self._select_triggers(triggers)
+    # The brake hazard has cleared.  Do not let a previous brake hold or
+    # cooldown block a lateral intervention that is now safe to execute.
+    self._active_until[brake_index] = -1
+    self._cooldown_until[brake_index] = -1
+
+    # Lateral actions retain the original hold/cooldown behavior to avoid
+    # steering chatter.  A newly selected lateral action is considered before
+    # an old hold, allowing a safe left/right intervention to replace it.
     for action, scenario_type, actor_id, distance in selected:
+      if action == "brake":
+        continue
       action_index = self.ACTION_INDEX[action]
       if frame < self._cooldown_until[action_index]:
         continue
+      if not self.allow_multi_action:
+        other_action = "right" if action == "left" else "left"
+        other_index = self.ACTION_INDEX[other_action]
+        self._active_until[other_index] = -1
+        self._cooldown_until[other_index] = -1
       self._active_until[action_index] = frame + self.hold_frames - 1
       self._cooldown_until[action_index] = self._active_until[action_index] + self.cooldown_frames
       alpha_vector[action_index] = self.fixed_alpha
       self._log_trigger(frame, action, scenario_type, actor_id, distance)
       if not self.allow_multi_action:
         break
+
+    if any(value > 0.0 for value in alpha_vector):
+      return alpha_vector
+
+    for action in ("left", "right"):
+      action_index = self.ACTION_INDEX[action]
+      if frame <= self._active_until[action_index]:
+        alpha_vector[action_index] = self.fixed_alpha
     return alpha_vector
 
   def _oracle_triggers(self) -> list[tuple[str, str, int | None, float]]:
@@ -305,6 +350,17 @@ class _BaseOraclePolicy(ActivationPolicy):
     dy = float(location_a.y - location_b.y)
     return math.hypot(dx, dy)
 
+  @staticmethod
+  def _ego_has_passed_actor(ego, actor) -> bool:
+    """Return whether the target actor is behind the ego's current heading."""
+    ego_location = ego.get_location()
+    actor_location = actor.get_location()
+    forward = ego.get_transform().get_forward_vector()
+    diff_x = actor_location.x - ego_location.x
+    diff_y = actor_location.y - ego_location.y
+    longitudinal = diff_x * forward.x + diff_y * forward.y
+    return longitudinal < 0.0
+
 
 class PDMOraclePolicy(_BaseOraclePolicy):
   """Conservative PDM-like oracle using only online CARLA actor/scenario state.
@@ -334,6 +390,12 @@ class PDMOraclePolicy(_BaseOraclePolicy):
       "NormalVehicleTakingPriority",
       "NormalVehicleRunningRedLight",
   })
+  # A DynamicObjectCrossing actor can be hidden until it enters the road.  The
+  # generic actor-geometry brake check is therefore often too late; brake as
+  # soon as scenario runner marks this scenario active.
+  ACTIVE_BRAKE_SCENARIOS = frozenset({
+      "DynamicObjectCrossing",
+  })
 
   def __init__(
       self,
@@ -357,10 +419,11 @@ class PDMOraclePolicy(_BaseOraclePolicy):
       side_hazard_distance: float = 25.0,
       side_hazard_two_way_distance: float = 10.0,
       roadblocked_distance: float = 40.0,
-      priority_distance: float = 50.0,
+      priority_distance: float = 10.0,
+      priority_path_lateral_margin: float = 3.0,
       yield_emergency_distance: float = 50.0,
       parking_exit_left: bool = True,
-      parking_exit_distance_to_driving_lane: float = 2.0,
+      parking_exit_distance_to_driving_lane: float = 3.0,
       parking_exit_clear_front_distance: float = 25.0,
       parking_exit_clear_rear_distance: float = 8.0,
       general_brake: bool = False,
@@ -388,12 +451,14 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     self.side_hazard_two_way_distance = float(side_hazard_two_way_distance)
     self.roadblocked_distance = float(roadblocked_distance)
     self.priority_distance = float(priority_distance)
+    self.priority_path_lateral_margin = float(priority_path_lateral_margin)
     self.yield_emergency_distance = float(yield_emergency_distance)
     self.parking_exit_left = bool(parking_exit_left)
     self.parking_exit_distance_to_driving_lane = float(parking_exit_distance_to_driving_lane)
     self.parking_exit_clear_front_distance = float(parking_exit_clear_front_distance)
     self.parking_exit_clear_rear_distance = float(parking_exit_clear_rear_distance)
     self.general_brake = bool(general_brake)
+    self._two_way_brake_latches = set()
 
   @classmethod
   def from_env(cls) -> "PDMOraclePolicy":
@@ -431,11 +496,12 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         side_hazard_distance=float(os.environ.get("PDM_ORACLE_SIDE_HAZARD_DISTANCE", 25.0)),
         side_hazard_two_way_distance=float(os.environ.get("PDM_ORACLE_SIDE_HAZARD_TWO_WAY_DISTANCE", 10.0)),
         roadblocked_distance=float(os.environ.get("PDM_ORACLE_ROADBLOCKED_DISTANCE", 40.0)),
-        priority_distance=float(os.environ.get("PDM_ORACLE_PRIORITY_DISTANCE", 50.0)),
+        priority_distance=float(os.environ.get("PDM_ORACLE_PRIORITY_DISTANCE", 10.0)),
+        priority_path_lateral_margin=float(os.environ.get("PDM_ORACLE_PRIORITY_PATH_LATERAL_MARGIN", 3.0)),
         yield_emergency_distance=float(os.environ.get("PDM_ORACLE_YIELD_EMERGENCY_DISTANCE", 50.0)),
         parking_exit_left=_strtobool(os.environ.get("PDM_ORACLE_PARKING_EXIT_LEFT", "1")),
         parking_exit_distance_to_driving_lane=float(
-            os.environ.get("PDM_ORACLE_PARKING_EXIT_DISTANCE_TO_DRIVING_LANE", 2.0)),
+            os.environ.get("PDM_ORACLE_PARKING_EXIT_DISTANCE_TO_DRIVING_LANE", 3.0)),
         parking_exit_clear_front_distance=float(os.environ.get("PDM_ORACLE_PARKING_EXIT_CLEAR_FRONT_DISTANCE", 1.0)),
         parking_exit_clear_rear_distance=float(os.environ.get("PDM_ORACLE_PARKING_EXIT_CLEAR_REAR_DISTANCE", 0.0)),
         general_brake=_strtobool(os.environ.get("PDM_ORACLE_GENERAL_BRAKE")),
@@ -456,18 +522,29 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
     ego_location = ego.get_location()
     scenarios = []
+    triggers = []
     for scenario_type, scenario_data in list(getattr(CarlaDataProvider, "active_scenarios", [])):
       actor = self._first_alive_actor(scenario_data)
       if actor is None:
+        # Keep the rule tied to scenario-runner state rather than an actor's
+        # visibility: crossing actors can be spawned underground or behind a
+        # blocker when the scenario becomes active.
+        if scenario_type in self.ACTIVE_BRAKE_SCENARIOS and self._action_allowed("brake"):
+          triggers.append(("brake", scenario_type, None, 0.0))
         continue
       distance = self._horizontal_distance(ego_location, actor.get_location())
       scenarios.append((distance, scenario_type, scenario_data, actor))
     scenarios.sort(key=lambda item: item[0])
 
-    triggers = []
     for distance, scenario_type, scenario_data, actor in scenarios:
       action = self._action_from_pdm_state(scenario_type, scenario_data, ego, actor, distance, CarlaDataProvider)
       if action is None or not self._action_allowed(action):
+        continue
+      # ``trigger_distance`` is radial, so an actor can stay within range long
+      # after the ego has passed it. Do not restart a lateral maneuver for a
+      # target that is now behind the ego. While it remains ahead, retries are
+      # still allowed when an initially unsafe adjacent lane becomes clear.
+      if action in ("left", "right") and self._ego_has_passed_actor(ego, actor):
         continue
       if self.min_distance <= distance <= self._distance_limit_for_scenario(scenario_type):
         actor_id = getattr(actor, "id", None)
@@ -493,6 +570,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     return triggers
 
   def _distance_limit_for_scenario(self, scenario_type: str) -> float:
+    if scenario_type in self.ACTIVE_BRAKE_SCENARIOS:
+      # Activation itself is the trigger for this rule, so do not discard it
+      # merely because the crossing actor is still off the driving lane.
+      return float("inf")
     if scenario_type in ("HazardAtSideLane",):
       return self.side_hazard_distance
     if scenario_type in ("HazardAtSideLaneTwoWays",):
@@ -506,6 +587,9 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     return self.trigger_distance
 
   def _action_from_pdm_state(self, scenario_type, scenario_data, ego, actor, distance, data_provider) -> str | None:
+    if scenario_type in self.ACTIVE_BRAKE_SCENARIOS:
+      return "brake"
+
     if scenario_type == "InvadingTurn":
       offset = self._invading_turn_offset(scenario_data)
       if offset is None:
@@ -517,9 +601,18 @@ class PDMOraclePolicy(_BaseOraclePolicy):
 
     if scenario_type in self.TWO_WAY_LATERAL_SCENARIOS:
       direction = self._scenario_direction(scenario_data)
+      latch_key = self._two_way_latch_key(scenario_type, scenario_data, actor)
       if self._two_way_path_clear(ego, scenario_data, direction, data_provider):
+        self._two_way_brake_latches.discard(latch_key)
         return self._lateral_action_from_direction(direction)
+      if latch_key in self._two_way_brake_latches:
+        return "brake"
       if self._scenario_actor_brake_hazard(ego, actor):
+        # Once braking starts for a blocked two-way detour, keep braking until
+        # the target lane is clear.  Slowing down otherwise makes the closing
+        # speed fall below the instantaneous hazard threshold and prematurely
+        # releases the brake.
+        self._two_way_brake_latches.add(latch_key)
         return "brake"
       return None
 
@@ -543,6 +636,11 @@ class PDMOraclePolicy(_BaseOraclePolicy):
       return None
 
     if scenario_type in self.PRIORITY_BRAKE_SCENARIOS:
+      if self._ego_in_actor_path(ego, actor):
+        # The ego is already in the cross-traffic actor's lane corridor.  A
+        # brake intervention would leave it in that path; let the planner
+        # continue clearing the conflict instead.
+        return None
       if distance <= self.priority_distance and self._priority_actor_conflict(ego, actor, scenario_data):
         return "brake"
       return None
@@ -606,6 +704,11 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         return False
     return True
 
+  @staticmethod
+  def _two_way_latch_key(scenario_type: str, scenario_data, actor) -> tuple[str, int]:
+    actor_id = getattr(actor, "id", None)
+    return scenario_type, int(actor_id) if actor_id is not None else id(scenario_data)
+
   def _collect_lane_keys(self, waypoint, distance: float) -> set[tuple[int, int]]:
     lane_keys = set()
     step = 2.0
@@ -667,6 +770,28 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     direction = self._scenario_direction(scenario_data)
     return direction is None or direction == actor_side
 
+  def _ego_in_actor_path(self, ego, actor) -> bool:
+    """Whether the ego is already ahead in the target actor's driving corridor."""
+    if actor is None or not getattr(actor, "is_alive", True):
+      return False
+    try:
+      actor_transform = actor.get_transform()
+      actor_location = actor_transform.location
+      ego_location = ego.get_location()
+      forward = actor_transform.get_forward_vector()
+      right = actor_transform.get_right_vector()
+    except Exception:
+      return False
+
+    diff_x = ego_location.x - actor_location.x
+    diff_y = ego_location.y - actor_location.y
+    longitudinal = diff_x * forward.x + diff_y * forward.y
+    lateral = abs(diff_x * right.x + diff_y * right.y)
+    return (
+        0.0 <= longitudinal <= self.priority_distance and
+        lateral <= self.priority_path_lateral_margin
+    )
+
   def _general_parking_exit_left_trigger(self, ego, data_provider):
     if not self.parking_exit_left:
       return None
@@ -678,6 +803,10 @@ class PDMOraclePolicy(_BaseOraclePolicy):
     ego_location = ego.get_location()
     ego_waypoint = self._get_waypoint_any(world_map, ego_location)
     if ego_waypoint is None:
+      return None
+    if getattr(ego_waypoint, "is_junction", False):
+      return None
+    if self._near_junction(ego_waypoint, distance=10.0):
       return None
 
     driving_waypoint = self._get_waypoint_driving(world_map, ego_location)
@@ -784,6 +913,33 @@ class PDMOraclePolicy(_BaseOraclePolicy):
       if self._waypoint_is_driving(current):
         return current
     return None
+
+  @staticmethod
+  def _near_junction(waypoint, distance: float) -> bool:
+    if waypoint is None:
+      return False
+    if getattr(waypoint, "is_junction", False):
+      return True
+
+    step = 2.0
+
+    def scan(method_name: str) -> bool:
+      current = waypoint
+      traveled = 0.0
+      while traveled < distance:
+        try:
+          next_waypoints = getattr(current, method_name)(step)
+        except Exception:
+          return False
+        if not next_waypoints:
+          return False
+        current = next_waypoints[0]
+        traveled += step
+        if getattr(current, "is_junction", False):
+          return True
+      return False
+
+    return scan("next") or scan("previous")
 
   def _general_brake_actor(self, ego, data_provider):
     for actor in self._vehicle_actors(data_provider) + self._walker_actors(data_provider):

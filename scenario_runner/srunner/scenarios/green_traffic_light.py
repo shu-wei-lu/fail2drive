@@ -96,3 +96,55 @@ class PriorityAtJunction(BasicScenario):
         Remove all actors upon deletion
         """
         self.remove_all_actors()
+
+
+class ForceRedLight(BasicScenario):
+    """Temporarily force all traffic lights at the next junction to red."""
+
+    timeout = 80
+
+    def __init__(self, world, ego_vehicles, config, randomize=False, debug_mode=False, criteria_enable=True,
+                 timeout=80):
+        self._world = world
+        self._map = CarlaDataProvider.get_map()
+        self._tl_dict = {}
+        self._duration = float(config.other_parameters.get("duration", {}).get("value", 30))
+
+        self.timeout = timeout
+        super().__init__("ForceRedLight",
+                         ego_vehicles,
+                         config,
+                         world,
+                         debug_mode,
+                         criteria_enable=criteria_enable)
+
+    def _initialize_actors(self, config):
+        """Find the next junction and collect all of its traffic lights."""
+        ego_location = config.trigger_points[0].location
+        starting_wp = self._map.get_waypoint(ego_location)
+
+        while not starting_wp.is_junction:
+            starting_wps = starting_wp.next(1.0)
+            if not starting_wps:
+                raise ValueError("Failed to find the next junction")
+            starting_wp = starting_wps[0]
+
+        junction = starting_wp.get_junction()
+        traffic_lights = self._world.get_traffic_lights_in_junction(junction.id)
+        if not traffic_lights:
+            raise ValueError("No traffic lights found at the next junction")
+
+        self._tl_dict = {
+            traffic_light: carla.TrafficLightState.Red
+            for traffic_light in traffic_lights
+        }
+
+    def _create_behavior(self):
+        """Hold the junction at red, then restore its previous light states."""
+        return TrafficLightFreezer(self._tl_dict, duration=self._duration)
+
+    def _create_test_criteria(self):
+        return []
+
+    def __del__(self):
+        self.remove_all_actors()

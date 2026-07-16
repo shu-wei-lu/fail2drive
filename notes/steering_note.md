@@ -31,9 +31,9 @@ END_STEERING_FRAME=180
 Aliases:
 
 ```bash
-export ACTIVATION_ALPHA=1.0
-export ACTIVATION_START_FRAME=100
-export ACTIVATION_END_FRAME=180
+export ACTIVATION_ALPHA=3.0
+export ACTIVATION_START_FRAME=50
+export ACTIVATION_END_FRAME=80
 ```
 
 Behavior:
@@ -49,7 +49,7 @@ For left/right with fixed frames, use single-vector mode:
 STEERING_ALPHA=1.0 \
 START_STEERING_FRAME=100 \
 END_STEERING_FRAME=180 \
-ACTIVATION_VECTOR_PATH=./steering/transfuser/post_process/left_change_lane/steering_vector.pt \
+export ACTIVATION_VECTOR_PATH=./steering/transfuser/post_process/left_change_lane/steering_vector.pt \
 python leaderboard/leaderboard/leaderboard_evaluator_local.py ...
 ```
 

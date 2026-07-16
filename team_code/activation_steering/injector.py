@@ -24,8 +24,10 @@ class ActivationInjector:
     self.vector_path = Path(vector_path) if vector_path else None
     self.vector_paths = [Path(path) if path else None for path in vector_paths] if vector_paths else None
     self.action_alpha_scales = action_alpha_scales or [1.0 for _ in self.ACTIONS]
-    self._vector = None
-    self._vectors = None
+    # Cache loaded payloads by their resolved file path. A configured path may
+    # either be a legacy .pt file or a directory containing one vector per
+    # decoder layer.
+    self._payload_cache: dict[Path, object] = {}
     self._warned_disabled = False
     self.verbose = os.environ.get("ACTIVATION_INJECTOR_VERBOSE", "0").lower() in ("1", "true", "t", "yes", "y")
 
@@ -66,38 +68,48 @@ class ActivationInjector:
       raise ValueError(f"Activation alpha must be scalar or length {len(self.ACTIONS)} [brake, left, right].")
     return values
 
-  def vector(self, reference: torch.Tensor) -> torch.Tensor:
+  def vector(
+      self,
+      reference: torch.Tensor,
+      layer_index: int | None = None,
+      num_layers: int | None = None,
+  ) -> torch.Tensor:
     if self.vector_path is None:
       raise RuntimeError("ActivationInjector has no vector path. Set ACTIVATION_VECTOR_PATH to enable it.")
-    if self._vector is None:
-      self._vector = self._load_vector()
-    return self._vector.to(device=reference.device, dtype=reference.dtype)
+    return self._vector_for_path(
+        self.vector_path, reference, layer_index=layer_index, num_layers=num_layers)
 
-  def _load_vector(self) -> torch.Tensor:
-    if self.vector_path is None:
-      raise RuntimeError("ActivationInjector has no vector path. Set ACTIVATION_VECTOR_PATH to enable it.")
-    vector = torch.load(self.vector_path, map_location="cpu").detach().float()
-    return vector
-
-  def apply(self, features: torch.Tensor, alpha: float | None = None) -> torch.Tensor:
+  def apply(
+      self,
+      features: torch.Tensor,
+      alpha: float | None = None,
+      layer_index: int | None = None,
+      num_layers: int | None = None,
+  ) -> torch.Tensor:
     alpha_value = self.alpha_value(alpha)
     if alpha_value <= 0.0:
       return features
     alpha_vector = self.alpha_vector(alpha)
     if alpha_vector.numel() == len(self.ACTIONS) and torch.count_nonzero(alpha_vector[1:]).item() > 0:
-      return self._apply_action_vectors(features, alpha_vector)
+      return self._apply_action_vectors(features, alpha_vector, layer_index, num_layers)
     if self._has_action_vectors():
-      return self._apply_action_vectors(features, alpha_vector)
+      return self._apply_action_vectors(features, alpha_vector, layer_index, num_layers)
     if self.vector_path is None:
       if not self._warned_disabled:
         print("[ActivationInjector] disabled: set ACTIVATION_VECTOR_PATH to enable activation steering", flush=True)
         self._warned_disabled = True
       return features
     if self.verbose:
-      print("[ActivationInjector] apply alpha =", alpha_value)
-    return features + float(alpha_vector[0]) * self.vector(features)
+      print(f"[ActivationInjector] apply layer={layer_index} alpha={alpha_value}")
+    return features + float(alpha_vector[0]) * self.vector(features, layer_index, num_layers)
 
-  def _apply_action_vectors(self, features: torch.Tensor, alpha_vector: torch.Tensor) -> torch.Tensor:
+  def _apply_action_vectors(
+      self,
+      features: torch.Tensor,
+      alpha_vector: torch.Tensor,
+      layer_index: int | None,
+      num_layers: int | None,
+  ) -> torch.Tensor:
     if not self._has_action_vectors():
       if not self._warned_disabled:
         print(
@@ -107,7 +119,7 @@ class ActivationInjector:
         self._warned_disabled = True
       return features
 
-    vectors = self.action_vectors(features)
+    vectors = self.action_vectors(features, layer_index, num_layers)
     result = features
     alpha_vector = alpha_vector.to(device=features.device, dtype=features.dtype)
     alpha_scales = torch.as_tensor(self.action_alpha_scales, device=features.device, dtype=features.dtype)
@@ -128,21 +140,93 @@ class ActivationInjector:
         active.append(f"{self.ACTIONS[index]}={effective_alpha:.3f}({raw_alpha:.3f}x{scale:.3f})")
       result = result + alpha * vector
     if active and self.verbose:
-      print("[ActivationInjector] apply actions:", ", ".join(active))
+      print(f"[ActivationInjector] apply layer={layer_index} actions:", ", ".join(active))
     return result
 
-  def action_vectors(self, reference: torch.Tensor) -> list[torch.Tensor | None]:
+  def action_vectors(
+      self,
+      reference: torch.Tensor,
+      layer_index: int | None = None,
+      num_layers: int | None = None,
+  ) -> list[torch.Tensor | None]:
     if self.vector_paths is None:
       raise RuntimeError("ActivationInjector has no action vector paths.")
-    if self._vectors is None:
-      self._vectors = [self._load_action_vector(path) for path in self.vector_paths]
-    return [None if vector is None else vector.to(device=reference.device, dtype=reference.dtype) for vector in self._vectors]
+    return [
+        None if path is None else self._vector_for_path(
+            path, reference, layer_index=layer_index, num_layers=num_layers)
+        for path in self.vector_paths
+    ]
 
-  def _load_action_vector(self, path: Path | None) -> torch.Tensor | None:
-    if path is None:
-      return None
-    vector = torch.load(path, map_location="cpu").detach().float()
-    return vector
+  def _vector_for_path(
+      self,
+      configured_path: Path,
+      reference: torch.Tensor,
+      layer_index: int | None,
+      num_layers: int | None,
+  ) -> torch.Tensor:
+    path = self._resolve_layer_path(configured_path, layer_index)
+    if path not in self._payload_cache:
+      self._payload_cache[path] = torch.load(path, map_location="cpu")
+    vector = self._select_layer_vector(
+        self._payload_cache[path], layer_index=layer_index, num_layers=num_layers)
+    if not torch.is_tensor(vector):
+      raise TypeError(f"Activation vector from {path} is not a tensor (got {type(vector).__name__}).")
+    return vector.detach().float().to(device=reference.device, dtype=reference.dtype)
+
+  @staticmethod
+  def _resolve_layer_path(configured_path: Path, layer_index: int | None) -> Path:
+    if not configured_path.is_dir():
+      return configured_path
+    if layer_index is None:
+      raise ValueError(
+          f"Layer-specific activation vector directory {configured_path} requires a layer index.")
+
+    layer_name = f"layer_{layer_index:02d}"
+    candidates = (
+        configured_path / layer_name / "steering_vector.pt",
+        configured_path / f"{layer_name}.pt",
+        configured_path / f"steering_vector_{layer_name}.pt",
+    )
+    for candidate in candidates:
+      if candidate.is_file():
+        return candidate
+    expected = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f"No activation vector found for decoder layer {layer_index} under {configured_path}. "
+        f"Expected one of: {expected}")
+
+  @staticmethod
+  def _select_layer_vector(payload, layer_index: int | None, num_layers: int | None):
+    """Select one layer from a packed payload, or return a legacy tensor.
+
+    Supported packed formats are {"vectors": tensor/list/dict}, a dict keyed
+    by layer_00/layer_01/..., or a tensor shaped [num_layers, *feature_shape].
+    The last tensor format intentionally keeps the feature batch dimension, so
+    an align-query bank normally has shape [6, 1, 48, 256].
+    """
+    if isinstance(payload, dict):
+      vectors = payload.get("vectors", payload)
+      if layer_index is None:
+        raise ValueError("A packed layer-specific activation vector requires a layer index.")
+      if isinstance(vectors, dict):
+        for key in (f"layer_{layer_index:02d}", str(layer_index), layer_index):
+          if key in vectors:
+            return vectors[key]
+        raise KeyError(f"Packed activation vector has no entry for decoder layer {layer_index}.")
+      if isinstance(vectors, (list, tuple)):
+        return vectors[layer_index]
+      payload = vectors
+
+    if torch.is_tensor(payload):
+      if (
+          layer_index is not None and
+          num_layers is not None and
+          payload.ndim >= 1 and
+          payload.shape[0] == num_layers
+      ):
+        return payload[layer_index]
+      return payload
+    return payload
 
   def _has_action_vectors(self) -> bool:
     return self.vector_paths is not None and any(path is not None for path in self.vector_paths)

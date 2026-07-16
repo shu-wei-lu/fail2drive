@@ -222,6 +222,17 @@ def read_measurements(path: Path) -> Iterable[dict]:
     yield row
 
 
+def read_hipad_metas(path: Path) -> Iterable[dict]:
+  for meta_path in sorted(path.glob('*.json')):
+    with meta_path.open('r', encoding='utf-8') as f:
+      meta = json.load(f)
+    row = dict(meta)
+    row['frame'] = int(meta_path.stem)
+    row['_hipad_meta'] = meta
+    row['_hipad_meta_path'] = str(meta_path)
+    yield row
+
+
 def action_logs(logs_root: Path) -> list[Path]:
   logs = sorted(logs_root.rglob('activation_actions.jsonl'))
   if logs:
@@ -229,7 +240,23 @@ def action_logs(logs_root: Path) -> list[Path]:
   return sorted({path.parent for path in logs_root.rglob('measurements/*.json.gz')})
 
 
+def post_process_sources(logs_root: Path, collection_root: Path, adapter_name: str) -> list[Path]:
+  sources = action_logs(logs_root)
+  if adapter_name not in ('hipad', 'hipad_plan'):
+    return sources
+
+  existing_runs = {run_name_for(source) for source in sources}
+  meta_dirs = sorted(
+      path for path in collection_root.rglob('metas')
+      if path.is_dir() and path.parent.parent.name == 'images'
+  )
+  sources.extend(path for path in meta_dirs if run_name_for(path) not in existing_runs)
+  return sources
+
+
 def run_name_for(log_source: Path) -> str:
+  if log_source.name == 'metas' and log_source.parent.parent.name == 'images':
+    return log_source.parent.name
   return log_source.parent.name if log_source.name == 'activation_actions.jsonl' else log_source.name
 
 
@@ -299,6 +326,15 @@ def sibling_feature_path_for(
     feature_name: str | None,
     layer_name: str | None,
 ) -> Path | None:
+  if log_source.name == 'metas' and log_source.parent.parent.name == 'images':
+    return feature_path_in_run_dir(
+        log_source.parent.parent.parent / 'features' / run_name,
+        frame,
+        model_index,
+        feature_name,
+        layer_name,
+    )
+
   log_dir = log_source.parent if log_source.name == 'activation_actions.jsonl' else log_source
   if log_dir.parent.name != 'logs':
     return None
@@ -473,10 +509,15 @@ def main() -> int:
   total_rows = 0
 
   with manifest_path.open('w', encoding='utf-8') as manifest:
-    for log_source in action_logs(logs_root):
+    for log_source in post_process_sources(logs_root, collection_root, args.adapter):
       run_name = run_name_for(log_source)
       match_context = match_context_for(log_source, run_name)
-      rows_iter = read_jsonl(log_source) if log_source.name == 'activation_actions.jsonl' else read_measurements(log_source)
+      if log_source.name == 'activation_actions.jsonl':
+        rows_iter = read_jsonl(log_source)
+      elif log_source.name == 'metas':
+        rows_iter = read_hipad_metas(log_source)
+      else:
+        rows_iter = read_measurements(log_source)
       rows = adapter.augment_rows(list(rows_iter), log_source, collection_root)
       rows = adapter.annotate_rows(rows, args)
       for row in rows:

@@ -4,8 +4,8 @@ pip install carla==0.9.15
 download ckpt in hipad
 
 # running
-export F2D=/media/user/data1/shu_wei/fail2drive
-export HIP=/media/user/data1/shu_wei/hip-ad
+export F2D=/mnt/bapve/thome/shuwei/fail2drive
+export HIP=/mnt/bapve/thome/shuwei/HiP-AD
 export CARLA_ROOT=$F2D/f2d_carla
 export PYTHONPATH=$F2D/leaderboard:$F2D/scenario_runner:$CARLA_ROOT/PythonAPI:$CARLA_ROOT/PythonAPI/carla:$HIP:$PYTHONPATH
 export IS_BENCH2DRIVE=1
@@ -28,13 +28,14 @@ SAVE_HIPAD_PLAN_FEATURES=1 python create_steering_features_all_splits.py \
   --save-visual-output
 
 # quick debug subset
-SAVE_HIPAD_PLAN_FEATURES=1 python create_steering_features_all_splits.py \
+SAVE_HIPAD_PLAN_FEATURES=1 python create_steering_features.py \
   --agent-file $F2D/team_code/hipad_f2d_agent.py \
   --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --output-root steering/hipad_debug \
-  --splits LaneChangeLeft \
-  --max-frames 400 \
-  --save-visual-output
+  --output-root steering/hipad_new/Left \
+  --routes steering_split/left \
+  --max-frames 200 \
+  --save-visual-output 
+
 
 # run local evaluate
 export CUDA_VISIBLE_DEVICES=6
@@ -50,7 +51,7 @@ export PDM_ORACLE_ALPHA=1.0
 # - GENERAL_BRAKE=0: only use scenario-runner triggers; set 1 for generic actor brake fallback.
 export ACTIVATION_POLICY=pdm_oracle
 export PDM_ORACLE_ACTION=auto
-export PDM_ORACLE_ALPHA=1.0
+export PDM_ORACLE_ALPHA=3.0
 export PDM_ORACLE_TRIGGER_DISTANCE=20
 export PDM_ORACLE_HOLD_FRAMES=30
 export PDM_ORACLE_COOLDOWN_FRAMES=40
@@ -59,15 +60,14 @@ export PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE=100
 export PDM_ORACLE_SIDE_HAZARD_DISTANCE=25
 export PDM_ORACLE_SIDE_HAZARD_TWO_WAY_DISTANCE=10
 export PDM_ORACLE_ROADBLOCKED_DISTANCE=40
-export PDM_ORACLE_PRIORITY_DISTANCE=50
+export PDM_ORACLE_PRIORITY_DISTANCE=25
 export PDM_ORACLE_YIELD_EMERGENCY_DISTANCE=50
 export PDM_ORACLE_GENERAL_BRAKE=0
+export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad_new/post_process/brake_align_q/steering_vector.pt,$F2D/steering/hipad_new/post_process/left_change_lane_align_q/steering_vector.pt,$F2D/steering/hipad_new/post_process/right_align_q/steering_vector.pt"
 
-export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad_new/post_process/Brake/steering_vector.pt,$F2D/steering/hipad_new/post_process/Left/steering_vector.pt,$F2D/steering/hipad_new/post_process/Right/steering_vector.pt"
-
-export BRAKE_ACTIVATION_ALPHA_SCALE=2.0
-export LEFT_ACTIVATION_ALPHA_SCALE=1.0
-export RIGHT_ACTIVATION_ALPHA_SCALE=1.0
+export BRAKE_ACTIVATION_ALPHA_SCALE=3.0
+export LEFT_ACTIVATION_ALPHA_SCALE=3.0
+export RIGHT_ACTIVATION_ALPHA_SCALE=2.0
 
 #### 
 
@@ -81,3 +81,10 @@ python local_evaluate.py \
   --restart-carla \
   --carla-root ./f2d_carla \
   --graphics-adapter 4 \
+
+# features
+python post_process_steering_features.py   --adapter hipad_plan   --collection-root steering/hipad_new   --output-dir steering/hipad_new/post_process/brake_align_q_v2   --action brake   --feature-name align_query   --layer-name layer_00   --positive-include-pattern Brake   --negative-include-pattern Normal --manual
+
+python post_process_steering_features.py   --adapter hipad_plan   --collection-root steering/hipad_new   --output-dir steering/hipad_new/post_process/right_align_q   --action right   --feature-name align_query   --layer-name layer_00   --positive-include-pattern Right   --negative-include-pattern Normal --manual
+
+python post_process_steering_features.py   --adapter hipad_plan   --collection-root steering/hipad_new   --output-dir steering/hipad_new/post_process/left_change_lane_align_q   --action left_change_lane   --feature-name align_query   --layer-name layer_00   --positive-include-pattern Left   --negative-include-pattern Normal --manual

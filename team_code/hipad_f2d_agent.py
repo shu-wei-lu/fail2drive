@@ -14,7 +14,7 @@ from activation_steering.policy import policy_from_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FAIL2DRIVE_ROOT = _REPO_ROOT / "fail2drive"
-_HIPAD_ROOT = _REPO_ROOT / "hip-ad"
+_HIPAD_ROOT = _REPO_ROOT / "HiP-AD"
 _HIPAD_LEADERBOARD = _HIPAD_ROOT / "bench2drive" / "leaderboard"
 _HIPAD_TEAM_CODE = _HIPAD_LEADERBOARD / "team_code"
 _HIPAD_AGENT = _HIPAD_LEADERBOARD / "team_code" / "hipad_b2d_agent.py"

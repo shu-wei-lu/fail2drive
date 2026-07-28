@@ -114,7 +114,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self._set_plan_feature_env()
         self._set_activation_env()
         control = super().run_step(input_data, timestamp)
-        self._log_activation_action(control)
+        # self._log_activation_action(control)
         return control
 
     def _set_plan_feature_env(self):

@@ -85,6 +85,17 @@ def parse_args() -> argparse.Namespace:
           '<collection-root>/<ActionDir>/picked_frames.json. Negative selection is unchanged.'
       ),
   )
+  parser.add_argument(
+      '--manual-negative-frames',
+      '--manual_negative_frames',
+      type=Path,
+      default=None,
+      help=(
+          'Use only manually picked negative frames from this JSON file. '
+          'The format is Dict[run_name, List[frame]], the same as picked_frames.json. '
+          'Negative include/exclude patterns are still applied.'
+      ),
+  )
   parser.add_argument('--steer-threshold', type=float, default=0.2)
   parser.add_argument('--normal-max-abs-steer', type=float, default=0.05)
   parser.add_argument(
@@ -185,24 +196,43 @@ def manual_positive_frame_path(
   raise FileNotFoundError(f'--manual expected picked frames at one of: {searched}')
 
 
+def load_manual_frames(path: Path, option_name: str) -> dict[str, set[int]]:
+  with path.open('r', encoding='utf-8') as f:
+    raw = json.load(f)
+  if not isinstance(raw, dict):
+    raise ValueError(f'{option_name} picked frames must be a JSON object: {path}')
+
+  picked: dict[str, set[int]] = {}
+  for run_name, frames in raw.items():
+    if not isinstance(run_name, str) or not isinstance(frames, list):
+      raise ValueError(f'{option_name} expected Dict[str, List[int]] in {path}')
+    picked[run_name] = {int(frame) for frame in frames}
+  return picked
+
+
 def load_manual_positive_frames(
     collection_root: Path,
     action: str,
     include_patterns: list[str],
 ) -> tuple[dict[str, set[int]], Path]:
   path = manual_positive_frame_path(collection_root, action, include_patterns)
+  return load_manual_frames(path, '--manual'), path
 
-  with path.open('r', encoding='utf-8') as f:
-    raw = json.load(f)
-  if not isinstance(raw, dict):
-    raise ValueError(f'--manual picked frames must be a JSON object: {path}')
 
-  picked: dict[str, set[int]] = {}
-  for run_name, frames in raw.items():
-    if not isinstance(run_name, str) or not isinstance(frames, list):
-      raise ValueError(f'--manual expected Dict[str, List[int]] in {path}')
-    picked[run_name] = {int(frame) for frame in frames}
-  return picked, path
+def validate_manual_frame_overlap(
+    positive_frames: dict[str, set[int]],
+    negative_frames: dict[str, set[int]],
+) -> None:
+  overlaps = []
+  for run_name in sorted(positive_frames.keys() & negative_frames.keys()):
+    for frame in sorted(positive_frames[run_name] & negative_frames[run_name]):
+      overlaps.append(f'{run_name}:{frame}')
+  if overlaps:
+    shown = ', '.join(overlaps[:10])
+    suffix = '' if len(overlaps) <= 10 else f' ... ({len(overlaps)} total)'
+    raise ValueError(
+        'Frames cannot be selected as both manual positive and manual negative: '
+        f'{shown}{suffix}')
 
 
 def read_jsonl(path: Path) -> Iterable[dict]:
@@ -449,12 +479,20 @@ def classify_target_action(row: dict, run_name: str, match_context: str, args: a
 
 
 def classify_frame(row: dict, run_name: str, match_context: str, args: argparse.Namespace, adapter) -> str | None:
+  frame = int(row['frame'])
   if args.manual:
     manual_frames = getattr(args, '_manual_positive_frames', {})
-    frame = int(row['frame'])
     if frame in manual_frames.get(run_name, set()):
       if matches_patterns(match_context, args.positive_include_pattern, args.positive_exclude_pattern):
         return adapter.filter_post_process_label(row, 'positive', args.action, run_name, args)
+      return None
+
+  manual_negative_frames = getattr(args, '_manual_negative_frames', None)
+  if manual_negative_frames is not None:
+    if frame in manual_negative_frames.get(run_name, set()):
+      if matches_patterns(match_context, args.negative_include_pattern, args.negative_exclude_pattern):
+        if matches_patterns(match_context, args.normal_include_pattern, args.normal_exclude_pattern):
+          return adapter.filter_post_process_label(row, 'negative', args.action, run_name, args)
       return None
 
   custom_label = adapter.classify_post_process_label(row, args.action, run_name, args)
@@ -467,6 +505,8 @@ def classify_frame(row: dict, run_name: str, match_context: str, args: argparse.
       return adapter.filter_post_process_label(row, 'positive', args.action, run_name, args)
     return None
   if custom_label == 'negative':
+    if manual_negative_frames is not None:
+      return None
     if matches_patterns(match_context, args.negative_include_pattern, args.negative_exclude_pattern):
       if matches_patterns(match_context, args.normal_include_pattern, args.normal_exclude_pattern):
         return adapter.filter_post_process_label(row, 'negative', args.action, run_name, args)
@@ -476,6 +516,8 @@ def classify_frame(row: dict, run_name: str, match_context: str, args: argparse.
     positive = classify_target_action(row, run_name, match_context, args, adapter)
     if positive is not None:
       return adapter.filter_post_process_label(row, positive, args.action, run_name, args)
+  if manual_negative_frames is not None:
+    return None
   normal = classify_normal(row, match_context, args)
   if normal is not None:
     return adapter.filter_post_process_label(row, normal, args.action, run_name, args)
@@ -492,10 +534,22 @@ def main() -> int:
   output_dir.mkdir(parents=True, exist_ok=True)
 
   manual_path = None
+  manual_frames: dict[str, set[int]] = {}
   if args.manual:
     manual_frames, manual_path = load_manual_positive_frames(
         collection_root, args.action, args.positive_include_pattern)
     setattr(args, '_manual_positive_frames', manual_frames)
+
+  manual_negative_path = args.manual_negative_frames
+  manual_negative_frames = None
+  if manual_negative_path is not None:
+    if not manual_negative_path.exists():
+      raise FileNotFoundError(
+          f'--manual-negative-frames file does not exist: {manual_negative_path}')
+    manual_negative_frames = load_manual_frames(
+        manual_negative_path, '--manual-negative-frames')
+    validate_manual_frame_overlap(manual_frames, manual_negative_frames)
+    setattr(args, '_manual_negative_frames', manual_negative_frames)
 
   accumulator = {
       'positive_sum': None,
@@ -574,13 +628,24 @@ def main() -> int:
           0 if manual_path is None
           else sum(len(frames) for frames in getattr(args, '_manual_positive_frames', {}).values())
       ),
+      'manual_negative_frames_path': (
+          None if manual_negative_path is None else str(manual_negative_path)
+      ),
+      'manual_negative_frame_count': (
+          0 if manual_negative_frames is None
+          else sum(len(frames) for frames in manual_negative_frames.values())
+      ),
       'output_files': {
           'positive_mean': str(output_dir / 'positive_mean.pt'),
           'negative_mean': str(output_dir / 'negative_mean.pt'),
           'steering_vector': str(output_dir / 'steering_vector.pt'),
           'selected_frames': str(manifest_path),
       },
-      'args': {key: value for key, value in vars(args).items() if not key.startswith('_')},
+      'args': {
+          key: str(value) if isinstance(value, Path) else value
+          for key, value in vars(args).items()
+          if not key.startswith('_')
+      },
   }
   (output_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
   print(json.dumps(summary, indent=2))

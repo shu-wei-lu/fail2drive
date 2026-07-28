@@ -51,21 +51,21 @@ export PDM_ORACLE_ALPHA=1.0
 # - GENERAL_BRAKE=0: only use scenario-runner triggers; set 1 for generic actor brake fallback.
 export ACTIVATION_POLICY=pdm_oracle
 export PDM_ORACLE_ACTION=auto
-export PDM_ORACLE_ALPHA=3.0
+export PDM_ORACLE_ALPHA=1.0
 export PDM_ORACLE_TRIGGER_DISTANCE=20
 export PDM_ORACLE_HOLD_FRAMES=30
-export PDM_ORACLE_COOLDOWN_FRAMES=40
-export PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=80
+export PDM_ORACLE_COOLDOWN_FRAMES=50
+export PDM_ORACLE_TWO_WAY_CLEAR_DISTANCE=70
 export PDM_ORACLE_LANE_KEY_SEARCH_DISTANCE=100
 export PDM_ORACLE_SIDE_HAZARD_DISTANCE=25
 export PDM_ORACLE_SIDE_HAZARD_TWO_WAY_DISTANCE=10
 export PDM_ORACLE_ROADBLOCKED_DISTANCE=40
 export PDM_ORACLE_PRIORITY_DISTANCE=25
 export PDM_ORACLE_YIELD_EMERGENCY_DISTANCE=50
-export PDM_ORACLE_GENERAL_BRAKE=0
-export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad_new/post_process/brake_align_q/steering_vector.pt,$F2D/steering/hipad_new/post_process/left_change_lane_align_q/steering_vector.pt,$F2D/steering/hipad_new/post_process/right_align_q/steering_vector.pt"
+export PDM_ORACLE_GENERAL_BRAKE=1
+export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad_new/post_process/brake_align_q_v5/steering_vector.pt,$F2D/steering/hipad_new/post_process/left_change_lane_align_q/steering_vector.pt,$F2D/steering/hipad_new/post_process/right_align_q/steering_vector.pt"
 
-export BRAKE_ACTIVATION_ALPHA_SCALE=3.0
+export BRAKE_ACTIVATION_ALPHA_SCALE=1.0
 export LEFT_ACTIVATION_ALPHA_SCALE=3.0
 export RIGHT_ACTIVATION_ALPHA_SCALE=2.0
 
@@ -83,8 +83,22 @@ python local_evaluate.py \
   --graphics-adapter 4 \
 
 # features
-python post_process_steering_features.py   --adapter hipad_plan   --collection-root steering/hipad_new   --output-dir steering/hipad_new/post_process/brake_align_q_v2   --action brake   --feature-name align_query   --layer-name layer_00   --positive-include-pattern Brake   --negative-include-pattern Normal --manual
+python post_process_steering_features.py   --adapter hipad_plan   --collection-root steering/hipad_new   --output-dir steering/hipad_new/post_process/brake_align_q_v3   --action brake   --feature-name align_query   --layer-name layer_00   --positive-include-pattern Brake   --negative-include-pattern Normal --manual
 
 python post_process_steering_features.py   --adapter hipad_plan   --collection-root steering/hipad_new   --output-dir steering/hipad_new/post_process/right_align_q   --action right   --feature-name align_query   --layer-name layer_00   --positive-include-pattern Right   --negative-include-pattern Normal --manual
 
 python post_process_steering_features.py   --adapter hipad_plan   --collection-root steering/hipad_new   --output-dir steering/hipad_new/post_process/left_change_lane_align_q   --action left_change_lane   --feature-name align_query   --layer-name layer_00   --positive-include-pattern Left   --negative-include-pattern Normal --manual
+
+python post_process_steering_features.py \
+  --adapter hipad_plan \
+  --collection-root steering/hipad_new \
+  --output-dir steering/hipad_new/post_process/brake_matchedv2 \
+  --action brake \
+  --feature-name align_query \
+  --layer-name layer_00 \
+  --positive-include-pattern Brake \
+  --negative-include-pattern Brake \
+  --manual \
+  --manual-negative-frames steering/hipad_new/Brake/negative_picked_frames.json
+
+  python slurm_evaluate.py   --routes fail2drive_split   --out_root results/hipad_oracle_new_6   --seeds 1   --retries 2  --agent_file ./team_code/hipad_f2d_agent.py   --agent_config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d"

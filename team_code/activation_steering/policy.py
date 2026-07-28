@@ -179,11 +179,11 @@ class _BaseOraclePolicy(ActivationPolicy):
     triggers = self._oracle_triggers()
     selected = self._select_triggers(triggers) if triggers else []
 
-    # Braking is a live safety decision, not a lane-change maneuver.  Recheck
-    # it every frame so an obstacle that remains in the ego path cannot fall
-    # into brake cooldown.  A live brake also interrupts any held lateral
-    # action; otherwise a previous lane-change activation could persist into a
-    # newly hazardous situation.
+    # Braking is a live safety decision, not a lane-change maneuver. Recheck it
+    # every frame so an obstacle that remains in the ego path cannot fall into
+    # brake cooldown. Scenario-specific live brakes interrupt a held lateral
+    # action; the generic fallback is handled below so it cannot cancel a
+    # lane-change maneuver that is already underway.
     brake_trigger = next((trigger for trigger in selected if trigger[0] == "brake"), None)
     lateral_hold_active = any(
         frame <= self._active_until[self.ACTION_INDEX[action]] for action in ("left", "right")
@@ -191,12 +191,16 @@ class _BaseOraclePolicy(ActivationPolicy):
     if (
         brake_trigger is not None and
         lateral_hold_active and
-        brake_trigger[1] in getattr(self, "TWO_WAY_LATERAL_SCENARIOS", frozenset())
+        (
+            brake_trigger[1] == "GeneralActorBrake" or
+            brake_trigger[1] in getattr(self, "TWO_WAY_LATERAL_SCENARIOS", frozenset())
+        )
     ):
       # Once a two-way detour has been declared clear and its lateral action
       # is underway, do not let a transient re-evaluation of that same class
-      # cancel the maneuver mid-hold.  Other live safety brakes (for example
-      # pedestrians or road blocks) retain priority over lateral steering.
+      # or the generic actor-brake fallback cancel the maneuver mid-hold.
+      # Scenario-specific safety brakes (for example pedestrians or road
+      # blocks) retain priority over lateral steering.
       brake_trigger = None
     brake_index = self.ACTION_INDEX["brake"]
     if brake_trigger is not None:
@@ -472,7 +476,7 @@ class PDMOraclePolicy(_BaseOraclePolicy):
         trigger_distance=float(os.environ.get("PDM_ORACLE_TRIGGER_DISTANCE", os.environ.get("ORACLE_TRIGGER_DISTANCE", 50.0))),
         min_distance=float(os.environ.get("PDM_ORACLE_MIN_DISTANCE", os.environ.get("ORACLE_MIN_DISTANCE", 0.0))),
         brake_hazard_distance=float(
-            os.environ.get("PDM_ORACLE_BRAKE_HAZARD_DISTANCE", os.environ.get("ORACLE_BRAKE_HAZARD_DISTANCE", 20.0))),
+            os.environ.get("PDM_ORACLE_BRAKE_HAZARD_DISTANCE", os.environ.get("ORACLE_BRAKE_HAZARD_DISTANCE", 15.0))),
         brake_hazard_lateral_margin=float(
             os.environ.get("PDM_ORACLE_BRAKE_HAZARD_LATERAL_MARGIN",
                            os.environ.get("ORACLE_BRAKE_HAZARD_LATERAL_MARGIN", 2.5))),

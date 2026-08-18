@@ -7,7 +7,9 @@ import sys
 import types
 from pathlib import Path
 
+import cv2
 import numpy as np
+from PIL import Image
 
 from activation_steering.policy import policy_from_env
 
@@ -99,6 +101,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         finally:
             os.chdir(cwd)
         self.is_visualize = _env_flag("DEBUG_CHALLENGE")
+        self.front_traj_vis_only = _env_flag("FRONT_TRAJ_VIS_ONLY", "0")
         if not self.is_visualize:
             self._remove_empty_log_visual_dirs()
         self.activation_action_log = self.save_path / "activation_actions.jsonl"
@@ -114,7 +117,7 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
         self._set_plan_feature_env()
         self._set_activation_env()
         control = super().run_step(input_data, timestamp)
-        # self._log_activation_action(control)
+        self._log_activation_action(control)
         return control
 
     def _set_plan_feature_env(self):
@@ -148,7 +151,17 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             except OSError:
                 pass
 
-    def visualize(self, *args, **kwargs):
+    def visualize(self, tick_data, input_batch, output_batch, pred_planning, target_point):
+        if self.front_traj_vis_only:
+            return self._visualize_front_temporal_plan(
+                tick_data, output_batch, pred_planning
+            )
+        return self._visualize_legacy(
+            tick_data, input_batch, output_batch, pred_planning, target_point
+        )
+
+    def _visualize_legacy(self, *args, **kwargs):
+        """Run HiP-AD's original six-camera + BEV visualization unchanged."""
         if self.visual_save_path is None:
             return super().visualize(*args, **kwargs)
         log_save_path = self.save_path
@@ -157,6 +170,57 @@ class Fail2DriveHiPADAgent(_BaseHiPADAgent):
             return super().visualize(*args, **kwargs)
         finally:
             self.save_path = log_save_path
+
+    def _visualize_front_temporal_plan(
+        self, tick_data, output_batch, fallback_planning
+    ):
+        """Save the front camera with only the temporal ego plan overlaid."""
+        image = np.ascontiguousarray(tick_data["imgs"]["CAM_FRONT"].copy())
+        predictions = output_batch[0]["img_bbox"]
+        planning = predictions.get("plan_temp_2hz", fallback_planning)
+        if hasattr(planning, "detach"):
+            planning = planning.detach().cpu().numpy()
+        planning = np.asarray(planning, dtype=np.float32)
+        if planning.ndim == 3:
+            planning = planning[0]
+
+        if planning.ndim == 2 and planning.shape[1] >= 2 and len(planning) > 0:
+            planning = np.concatenate(
+                [np.zeros((1, 2), dtype=np.float32), planning[:, :2]], axis=0
+            )
+            coord3d = np.concatenate(
+                [
+                    planning,
+                    np.full((len(planning), 1), -1.8, dtype=np.float32),
+                    np.ones((len(planning), 1), dtype=np.float32),
+                ],
+                axis=1,
+            )
+            projected = (self.lidar2img["CAM_FRONT"] @ coord3d.T).T
+            valid = projected[:, 2] > 1e-5
+            projected = projected[valid, :2] / projected[valid, 2:3]
+            height, width = image.shape[:2]
+            in_image = (
+                (projected[:, 0] >= 0)
+                & (projected[:, 0] < width)
+                & (projected[:, 1] >= 0)
+                & (projected[:, 1] < height)
+            )
+            points = np.rint(projected[in_image]).astype(np.int32)
+            if len(points) >= 2:
+                polyline = points.reshape(-1, 1, 2)
+                cv2.polylines(image, [polyline], False, (20, 20, 20), 11, cv2.LINE_AA)
+                cv2.polylines(image, [polyline], False, (0, 220, 255), 6, cv2.LINE_AA)
+            for point in points:
+                center = tuple(point)
+                cv2.circle(image, center, 7, (20, 20, 20), -1, cv2.LINE_AA)
+                cv2.circle(image, center, 4, (0, 220, 255), -1, cv2.LINE_AA)
+
+        output_path = self.visual_save_path or self.save_path
+        frame = self.step
+        Image.fromarray(image).save(output_path / "images" / ("%04d.png" % frame))
+        with open(output_path / "metas" / ("%04d.json" % frame), "w", encoding="utf-8") as outfile:
+            json.dump(self.pid_metadata, outfile, indent=4)
 
     def destroy(self, results=None):
         super().destroy()

@@ -214,8 +214,9 @@ DEPTH_TTC_STEERING=1
 Action alpha flags:
 
 ```bash
-DEPTH_TTC_BRAKE_ALPHA=3.0
-DEPTH_TTC_LATERAL_ALPHA=1.0
+export DEPTH_TTC_BRAKE_ALPHA=3.0
+export DEPTH_TTC_LEFT_ALPHA=1.0
+export DEPTH_TTC_RIGHT_ALPHA=1.0
 ```
 
 Scheduling flags:
@@ -230,8 +231,8 @@ Depth TTC uses action-vector alpha candidates:
 
 - original: `[0,0,0]`
 - brake: `[DEPTH_TTC_BRAKE_ALPHA,0,0]`
-- left: `[0,DEPTH_TTC_LATERAL_ALPHA,0]`
-- right: `[0,0,DEPTH_TTC_LATERAL_ALPHA]`
+- left: `[0,DEPTH_TTC_LEFT_ALPHA,0]`
+- right: `[0,0,DEPTH_TTC_RIGHT_ALPHA]`
 
 ## VLM Steering
 

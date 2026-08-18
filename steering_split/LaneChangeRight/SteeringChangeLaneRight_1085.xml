@@ -10,10 +10,9 @@
     </waypoints>
     <scenarios>
       <scenario name="SteeringChangeLaneRight" type="StaticPropOnRoad">
-        <distance value="40" />
+        <distance value="15" />
         <stop_time value="30" />
-        <prop value="static.prop.trafficwarning" />
-        <yaw_offset value="-90" />
+        <prop value="vehicle.mercedes.coupe" />
         <lateral_offset value="-1.5" />
         <trigger_point x="-792.2" y="6025.9" z="148.2" yaw="-170.4" />
       </scenario>

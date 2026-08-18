@@ -1,242 +1,224 @@
-# Steering Features Creation
+# Steering Features: Manual-Pick Workflow
 
-This documents the recreated steering split and the collection/post-processing flow for TransFuser and HiP-AD steering vectors.
+Positive frames are selected manually with `picked_frames.json`. Automatic
+positive-frame thresholds are optional and listed at the end.
 
-## Recreated Split
+## 1. Collect Features
 
-The route ids came from `steering/transfuser/post_process/*/selected_frames.jsonl`. They are original `fail2drive_split` route ids.
+Use one output directory per split:
 
-Generated files live under `steering_split`:
+| Routes | Output directory |
+|---|---|
+| `steering_split/Brake` | `steering/<planner>/Brake` |
+| `steering_split/Normal` | `steering/<planner>/Normal` |
+| `steering_split/left` | `steering/<planner>/left` or `Left` |
+| `steering_split/right` | `steering/<planner>/right` or `Right` |
 
-- `Brake`: `SteeringVehicleOnRoad_0000`, `0037`, `0038`, `1085`
-- `LaneChangeLeft`: `SteeringChangeLaneLeft_0000`-`0004`, `0035`-`0039`, `1085`-`1089`
-- `LaneChangeRight`: `SteeringChangeLaneRight_0000`-`0004`, `0035`-`0039`, `1085`-`1089`
-- `Normal`: `Normal_0000`, `1085`
-
-The repo ignores `*.xml` globally, so `.gitignore` explicitly unignores `steering_split/**/*.xml`.
-
-Run this to recreate the XML files:
-
-```bash
-cd fail2drive
-python create_steering_split.py
-```
-
-Implementation details:
-
-- `Brake` uses a `VehicleOnRoad` scenario with a stationary vehicle on the route and `lateral_offset=0`.
-- `LaneChangeLeft` uses `VehicleOnRoad` with `distance=30` and `lateral_offset=1.5`, placing the stationary vehicle to the right so the ego steers left.
-- `LaneChangeRight` uses `VehicleOnRoad` with `distance=30` and `lateral_offset=-1.5`, placing the stationary vehicle to the left so the ego steers right.
-- `Normal` strips all scenarios and keeps only the original route/weather/waypoints. Do not set `NO_OTHER_VEHICLES=1` when collecting Normal if you want normal background actors; `RouteScenario` adds `BackgroundBehavior` by default.
-
-## Collect Features
-
-Start CARLA and source the normal Fail2Drive environment first, then collect all four groups into sibling folders under `steering/transfuser`.
+The Slurm wrapper submits one job and starts one CARLA instance for every XML
+inside `--routes`:
 
 ```bash
-cd fail2drive
-source env_vars.sh
-
-python create_steering_features_all_splits.py \
+python slurm_create_steering_features.py \
+  --routes steering_split/Brake \
   --agent-file team_code/sensor_agent.py \
   --agent-config checkpoints/tfpp \
-  --output-root steering/transfuser
-```
-
-This writes:
-
-```text
-steering/transfuser/Normal
-steering/transfuser/Brake
-steering/transfuser/LaneChangeLeft
-steering/transfuser/LaneChangeRight
-```
-
-To run only one split, call the underlying script directly:
-
-```bash
-python create_steering_features.py \
-  --routes steering_split/Normal \
-  --agent-file team_code/sensor_agent.py \
-  --agent-config checkpoints/tfpp \
-  --output-root steering/transfuser/Normal
-```
-
-Useful collection options:
-
-- `--max-frames N`: stop each route early for quick debug runs.
-- `--route-filter 1085`: run only XML filenames containing that substring.
-- `--save-visual-output`: save debug images under `<output-root>/images`.
-- `--traffic-manager-seed N`: change background traffic deterministically.
-- `--no-other-vehicles`: set `NO_OTHER_VEHICLES=1` inside the evaluator subprocess to disable background and parked vehicles.
-- `--splits Normal LaneChangeLeft`: with `create_steering_features_all_splits.py`, run only the listed split folders.
-- `--keep-going`: with `create_steering_features_all_splits.py`, continue remaining splits after one split fails.
-
-## Collect HiP-AD Features
-
-HiP-AD uses the same steering split, but feature collection needs two extra pieces:
-
-- `SAVE_HIPAD_PLAN_FEATURES=1` writes the selected HiP-AD plan feature tensor.
-- `--save-visual-output` writes `images/<run>/metas/*.json`, which contains `plan_spat`, `plan_temp`, `aim`, and `angle_final`. The HiP-AD post-process rule uses these meta files to label lane-change intention frames.
-
-The default saved feature is the last plan refine layer (`HIPAD_PLAN_FEATURE_LAYER=-1`, equivalent to layer 5 for the 6-layer stage2 decoder).
-
-```bash
-cd fail2drive
-source env_vars.sh
-export F2D=/media/user/data1/shu_wei/fail2drive
-export HIP=/media/user/data1/shu_wei/hip-ad
-
-SAVE_HIPAD_PLAN_FEATURES=1 python create_steering_features_all_splits.py \
-  --agent-file $F2D/team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --output-root steering/hipad \
+  --output-root steering/transfuser/Brake \
+  --conda-env fail2drive \
   --save-visual-output
 ```
 
-For quick debug runs, add `--max-frames N` or `--route-filter 0000`. If `--save-visual-output` is omitted, HiP-AD still logs `activation_actions.jsonl`, but the meta-driven lane-change labels cannot be used.
-
-## Post Process
-
-The post-process script can scan all four collection roots through the parent `steering/transfuser`. Include/exclude patterns are case-sensitive substrings matched against the run name and log path.
+For HiP-AD, export the HiP-AD environment first, including
+`SAVE_HIPAD_PLAN_FEATURES=1`, then change the agent:
 
 ```bash
-python post_process_steering_features.py \
-  --collection-root steering/transfuser \
-  --output-dir steering/transfuser/post_process/Brake \
-  --action brake \
-  --positive-include-pattern Brake \
-  --negative-include-pattern Normal \
-  --brake-threshold 0.5 \
-  --brake-min-target-speed-drop 1.5 \
-  --brake-min-speed-ratio 1.15 \
-  --brake-min-run-length 3 \
-  --normal-throttle-threshold 0.1 \
-  --min-speed 5.0
-
-python post_process_steering_features.py \
-  --collection-root steering/transfuser \
-  --output-dir steering/transfuser/post_process/left_change_lane \
-  --action left_change_lane \
-  --positive-include-pattern LaneChangeLeft \
-  --negative-include-pattern Normal \
-  --steer-threshold 0.2 \
-  --normal-max-abs-steer 0.05 \
-  --normal-throttle-threshold 0.1 \
-  --min-speed 5.0
-
-python post_process_steering_features.py \
-  --collection-root steering/transfuser \
-  --output-dir steering/transfuser/post_process/right_change_lane \
-  --action right_change_lane \
-  --positive-include-pattern LaneChangeRight \
-  --negative-include-pattern Normal \
-  --steer-threshold 0.2 \
-  --normal-max-abs-steer 0.05 \
-  --normal-throttle-threshold 0.1 \
-  --min-speed 5.0
+python slurm_create_steering_features.py \
+  --routes steering_split/Brake \
+  --agent-file "$F2D/team_code/hipad_f2d_agent.py" \
+  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
+  --output-root steering/hipad_new/Brake \
+  --conda-env hipad \
+  --save-visual-output
 ```
 
-Each post-process run writes:
+The collection layout remains:
 
-- `positive_mean.pt`
-- `negative_mean.pt`
-- `steering_vector.pt`
-- `selected_frames.jsonl`
-- `summary.json`
+```text
+<collection-root>/<Split>/
+├── features/<run>/...
+├── images/<run>/...
+├── logs/<run>/activation_actions.jsonl
+├── results/
+├── stderr/
+└── stdout/
+```
 
-The vector formula is `positive_mean - negative_mean`.
+## 2. Create `picked_frames.json`
 
-## Post Process HiP-AD
+After inspecting the images, metadata, and action log, put a
+`picked_frames.json` in each positive split:
 
-Use the `hipad_plan` adapter for HiP-AD. For lane-change actions, this adapter uses `images/<run>/metas/*.json` rather than only `activation_actions.jsonl`.
-For newer HiP-AD runs that save multiple tensors under
-`features/<run>/<feature-name>/<layer-name>/<frame>.pt`, choose the tensor with
-`--feature-name` and `--layer-name`. Older runs that save directly under
-`features/<run>/<frame>.pt` keep working without these flags.
+```text
+steering/<planner>/Brake/picked_frames.json
+steering/<planner>/left/picked_frames.json
+steering/<planner>/right/picked_frames.json
+```
 
-The lane-change positive rule is based on planning intention:
+Use the actual directory capitalization (`Left`/`Right` when applicable). The
+JSON key must exactly match a run name under `features/` and `logs/`:
 
-- left: `plan_spat` x moves negative enough, `aim.x` is negative, and `angle_final` is negative.
-- right: the same rule with positive signs.
+```json
+{
+  "SteeringVehicleOnRoad_0000_route0_07_29_16_28_55": [128, 129, 130]
+}
+```
 
-The default thresholds are:
+Frame values are integers without `.pt`. With `--manual`, these are the only
+positive frames. Negative frames still come from the Normal split unless
+`--manual-negative-frames` is also supplied.
 
-- `--hipad-plan-spat-mean-threshold 1.0`
-- `--hipad-plan-spat-last-threshold 0.8`
-- `--hipad-plan-spat-first-threshold 0.0`
-- `--hipad-plan-aim-threshold 0.5`
-- `--hipad-plan-angle-threshold 0.12`
-- `--hipad-plan-min-desired-speed 0.0`
+## 3. Manual TransFuser Post-Process
 
-Normal frames require near-straight planning:
+Choose one action:
 
-- `--hipad-normal-plan-spat-mean-max 0.25`
-- `--hipad-normal-plan-spat-last-max 0.4`
-- `--hipad-normal-aim-max 0.2`
-- `--hipad-normal-angle-max 0.05`
+| Action | `ACTION` | `POSITIVE_SPLIT` | `OUTPUT_NAME` |
+|---|---|---|---|
+| Brake | `brake` | `Brake` | `brake_manual` |
+| Left | `left_change_lane` | `left` | `left_manual` |
+| Right | `right_change_lane` | `right` | `right_manual` |
 
-Brake positives normally use the brake/target-speed labels from the action log. Add
-`--hipad-brake-require-neutral-plan` when building a cleaner brake vector; this requires
-both brake positives and normal negatives to pass the same near-straight planning
-thresholds above.
-
-Example:
+Example for Brake; change the three variables using the table:
 
 ```bash
-python post_process_steering_features.py \
-  --adapter hipad_plan \
-  --collection-root steering/hipad \
-  --output-dir steering/hipad/post_process/brake \
-  --action brake \
-  --feature-name align_query \
-  --layer-name layer_02 \
-  --positive-include-pattern Brake \
-  --negative-include-pattern Normal \
-  --hipad-brake-require-neutral-plan
+ACTION=brake
+POSITIVE_SPLIT=Brake
+OUTPUT_NAME=brake_manual
 
 python post_process_steering_features.py \
-  --adapter hipad_plan \
-  --collection-root steering/hipad \
-  --output-dir steering/hipad/post_process/left_change_lane_meta \
-  --action left_change_lane \
-  --feature-name align_query \
-  --layer-name layer_02 \
-  --positive-include-pattern LaneChangeLeft \
-  --negative-include-pattern Normal
-
-python post_process_steering_features.py \
-  --adapter hipad_plan \
-  --collection-root steering/hipad \
-  --output-dir steering/hipad/post_process/right_change_lane_meta \
-  --action right_change_lane \
-  --feature-name align_query \
-  --layer-name layer_02 \
-  --positive-include-pattern LaneChangeRight \
+  --adapter transfuser_target_speed \
+  --collection-root steering/transfuser \
+  --output-dir "steering/transfuser/post_process/$OUTPUT_NAME" \
+  --action "$ACTION" \
+  --manual \
+  --positive-include-pattern "$POSITIVE_SPLIT" \
   --negative-include-pattern Normal
 ```
 
-For a stricter left-lane-change vector that requires near-point lateral intent and avoids low-speed/stop signatures, use:
+Pattern matching is case-sensitive. Set `POSITIVE_SPLIT=Left` instead of
+`left` when the actual collection directory is `Left`.
+
+## 4. Manual HiP-AD Post-Process
+
+The current `steering/hipad_new` runs use `align_query/layer_00`.
+
+| Action | `ACTION` | `POSITIVE_SPLIT` | `OUTPUT_NAME` |
+|---|---|---|---|
+| Brake | `brake` | `Brake` | `brake_manual` |
+| Left | `left_change_lane` | `Left` | `left_manual` |
+| Right | `right_change_lane` | `Right` | `right_manual` |
+
+Example for Brake; change the three variables using the table:
 
 ```bash
+ACTION=brake
+POSITIVE_SPLIT=Brake
+OUTPUT_NAME=brake_manual
+
 python post_process_steering_features.py \
   --adapter hipad_plan \
-  --collection-root steering/hipad \
-  --output-dir steering/hipad/post_process/left_change_lane_meta_fast_aim \
-  --action left_change_lane \
+  --collection-root steering/hipad_new \
+  --output-dir "steering/hipad_new/post_process/$OUTPUT_NAME" \
+  --action "$ACTION" \
   --feature-name align_query \
-  --layer-name layer_02 \
-  --positive-include-pattern LaneChangeLeft \
-  --negative-include-pattern Normal \
-  --hipad-plan-aim-threshold 0.4 \
-  --hipad-plan-spat-first-threshold 0.4 \
-  --hipad-plan-min-desired-speed 3.0
+  --layer-name layer_00 \
+  --manual \
+  --positive-include-pattern "$POSITIVE_SPLIT" \
+  --negative-include-pattern Normal
 ```
 
-The meta-driven rule skips frames without a matching `metas/<frame>.json`. HiP-AD visualization currently saves every 2 frames, so selected lane-change frames are usually even-numbered. For the observed left-lane-change run, frames `0170` through `0220` match the default positive rule.
+## 5. Optional Manual Negatives
 
-To fall back to the old action-log steer-threshold labels, add:
+To manually choose negatives too, create a JSON file with the same format:
+
+```text
+steering/hipad_new/Brake/negative_picked_frames.json
+```
+
+Add these arguments:
 
 ```bash
---hipad-disable-plan-meta-labels
+--manual-negative-frames steering/hipad_new/Brake/negative_picked_frames.json \
+--negative-include-pattern Brake
 ```
+
+Remove the earlier `--negative-include-pattern Normal`. A frame cannot appear
+in both the positive and negative JSON files.
+
+## 6. Verify the Result
+
+Every successful run writes:
+
+```text
+positive_mean.pt
+negative_mean.pt
+steering_vector.pt
+selected_frames.jsonl
+summary.json
+```
+
+The formula is:
+
+```text
+steering_vector = positive_mean - negative_mean
+```
+
+Check `summary.json`:
+
+- `manual_positive_frames_path` points to the intended file.
+- `manual_positive_frame_count` equals the number of picked frames.
+- `positive_count` and `negative_count` are non-zero.
+- `missing_features` is normally zero.
+- HiP-AD uses the intended `feature_name` and `layer_name`.
+
+Use `selected_frames.jsonl` to audit every frame used in the final vector.
+
+## 7. Optional Filters and Automatic Selection
+
+Feature-collection route selection is optional:
+
+- `--routes steering_split/Brake`: run every XML in the split.
+- `--routes path/to/route.xml`: run only that route.
+- `--route-filter 1085`: keep only filenames containing `1085`.
+- `--route-limit N`: run only the first `N` selected XML files.
+- `--max-frames N`: stop each route after `N` evaluator frames.
+
+These case-sensitive patterns restrict which runs may contribute:
+
+- `--positive-include-pattern` / `--positive-exclude-pattern`
+- `--negative-include-pattern` / `--negative-exclude-pattern`
+
+With `--manual`, positive thresholds are disabled. The patterns only restrict
+where manually listed frames may come from.
+
+Automatically selected Normal negatives can still be controlled with:
+
+- `--normal-max-abs-steer`
+- `--normal-throttle-threshold`
+- `--min-speed`
+- `--exclude-stop-sign`
+- `--normal-include-pattern` / `--normal-exclude-pattern`
+- `--max-frames-per-class`
+
+For fully automatic positive selection, omit `--manual`. TransFuser then uses:
+
+- Lane change: `--steer-threshold`.
+- Brake: `--brake-threshold`, `--brake-min-target-speed-drop`,
+  `--brake-min-speed-ratio`, `--brake-min-run-length`, and
+  `--brake-target-speed-state-threshold`.
+- Optional run filtering: `--brake-include-pattern` and
+  `--brake-exclude-pattern`.
+
+HiP-AD automatic lane-change selection additionally uses the
+`--hipad-plan-*` thresholds, while automatic Normal selection uses the
+`--hipad-normal-*` thresholds. These are not required for manually picked
+positives unless an extra adapter filter such as
+`--hipad-brake-require-neutral-plan` is explicitly enabled.

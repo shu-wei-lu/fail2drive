@@ -38,6 +38,7 @@ import jsonpickle
 import jsonpickle.ext.numpy as jsonpickle_numpy
 import ujson  # Like json but faster
 import gzip
+from PIL import Image
 
 jsonpickle_numpy.register_handlers()
 jsonpickle.set_encoder_options('json', sort_keys=True, indent=4)
@@ -279,6 +280,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     self.metric_info = {}
     self.live_visu = strtobool(os.environ.get('LIVE_VISU', 'False'))
+    self.front_traj_vis_only = strtobool(os.environ.get('FRONT_TRAJ_VIS_ONLY', 'False'))
     self._visu_interface = None
     self._quit_requested = False
 
@@ -798,26 +800,35 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       else:
         prob_target_speed = pred_target_speed
 
-      debug_image = self.nets[0].visualize_model(
-          self.visual_output_path if self.visual_output_path is not None else '.',
-          self.step,
-          tick_data['rgb'],
-          lidar_bev,
-          tick_data['target_point'],
-          pred_wp,
-          target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
-          pred_semantic=pred_semantic,
-          pred_bev_semantic=pred_bev_semantic,
-          pred_depth=pred_depth,
-          pred_checkpoint=pred_checkpoint,
-          pred_speed=prob_target_speed,
-          pred_target_speed_scalar=pred_target_speed_scalar,
-          pred_bb=bbs_vehicle_coordinate_system,
-          gt_speed=gt_velocity,
-          gt_wp=pred_wp_1,
-          wp_selected=wp_selected,
-          return_image=self.live_visu,
-          save_to_disk=(self.visual_output_path is not None))
+      if self.front_traj_vis_only:
+        debug_image = self._visualize_front_checkpoint(
+            tick_data['rgb_front_np'],
+            pred_checkpoint,
+            self.visual_output_path if self.visual_output_path is not None else '.',
+            self.step,
+            return_image=self.live_visu,
+            save_to_disk=(self.visual_output_path is not None))
+      else:
+        debug_image = self.nets[0].visualize_model(
+            self.visual_output_path if self.visual_output_path is not None else '.',
+            self.step,
+            tick_data['rgb'],
+            lidar_bev,
+            tick_data['target_point'],
+            pred_wp,
+            target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
+            pred_semantic=pred_semantic,
+            pred_bev_semantic=pred_bev_semantic,
+            pred_depth=pred_depth,
+            pred_checkpoint=pred_checkpoint,
+            pred_speed=prob_target_speed,
+            pred_target_speed_scalar=pred_target_speed_scalar,
+            pred_bb=bbs_vehicle_coordinate_system,
+            gt_speed=gt_velocity,
+            gt_wp=pred_wp_1,
+            wp_selected=wp_selected,
+            return_image=self.live_visu,
+            save_to_disk=(self.visual_output_path is not None))
 
       if self.live_visu and debug_image is not None:
         self._display_debug_output(debug_image)
@@ -984,12 +995,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
   @staticmethod
   def _depth_ttc_candidate_alphas():
     brake_alpha = float(os.environ.get('DEPTH_TTC_BRAKE_ALPHA', 3.0))
-    lateral_alpha = float(os.environ.get('DEPTH_TTC_LATERAL_ALPHA', 1.0))
+    left_alpha = float(os.environ.get('DEPTH_TTC_LEFT_ALPHA', 1.0))
+    right_alpha = float(os.environ.get('DEPTH_TTC_RIGHT_ALPHA', 1.0))
     return [
         ('original', [0.0, 0.0, 0.0]),
         ('brake', [brake_alpha, 0.0, 0.0]),
-        ('left', [0.0, lateral_alpha, 0.0]),
-        ('right', [0.0, 0.0, lateral_alpha]),
+        ('left', [0.0, left_alpha, 0.0]),
+        ('right', [0.0, 0.0, right_alpha]),
     ]
 
   def _depth_ttc_alpha_for_candidate(self, candidate):
@@ -1210,6 +1222,40 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       return None
 
     return projected_xy, np.nonzero(valid)[0]
+
+  def _visualize_front_checkpoint(
+      self, rgb_image, pred_checkpoint, save_path, step, return_image=False, save_to_disk=True):
+    """Save the front camera with only TransFuser's predicted checkpoints overlaid."""
+    image = np.ascontiguousarray(np.asarray(rgb_image).copy())
+    if hasattr(pred_checkpoint, 'detach'):
+      pred_checkpoint = pred_checkpoint.detach().cpu().numpy()
+    projected = self._project_ego_points_to_front_image(pred_checkpoint)
+    if projected is not None:
+      points = np.rint(projected[0]).astype(np.int32)
+      # HiP-AD renders at 1600x900. Scale the same drawing parameters to
+      # TransFuser's cropped 1024x384 image so their relative sizes match.
+      scale = max(float(image.shape[0]) / 900.0, 0.25)
+      outline_width = max(1, int(round(11 * scale)))
+      line_width = max(1, int(round(6 * scale)))
+      outer_radius = max(1, int(round(7 * scale)))
+      inner_radius = max(1, int(round(4 * scale)))
+      if len(points) >= 2:
+        polyline = points.reshape(-1, 1, 2)
+        cv2.polylines(
+            image, [polyline], False, (20, 20, 20), outline_width, cv2.LINE_AA)
+        cv2.polylines(
+            image, [polyline], False, (0, 220, 255), line_width, cv2.LINE_AA)
+      for point in points:
+        center = tuple(point)
+        cv2.circle(image, center, outer_radius, (20, 20, 20), -1, cv2.LINE_AA)
+        cv2.circle(image, center, inner_radius, (0, 220, 255), -1, cv2.LINE_AA)
+
+    if save_to_disk:
+      output_path = pathlib.Path(save_path) / f'{step:04}.png'
+      output_path.parent.mkdir(parents=True, exist_ok=True)
+      Image.fromarray(image.astype(np.uint8)).save(output_path)
+    if return_image:
+      return image
 
   def _save_fused_features(self, fused_features, model_idx, frame_idx):
     if self.fused_features_save_path is None or fused_features is None:

@@ -21,6 +21,14 @@ import os
 from nav_planner import LateralPIDController, get_throttle
 from activation_steering.injector import ActivationInjector
 
+
+def _env_flag(name, default=False):
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  return str(value).lower() in ('1', 'true', 't', 'yes', 'y')
+
+
 class LidarCenterNet(nn.Module):
   """
   The main model class. It can run all model configurations.
@@ -35,6 +43,20 @@ class LidarCenterNet(nn.Module):
     self.make_histogram = int(os.environ.get('HISTOGRAM', 0))
     vector_path = Path(__file__).resolve().parent.parent / 'steering_feats' / 'brake_minus_normal.pt'
     self.activation_injector = ActivationInjector.from_env(vector_path)
+    self.transfuser_activation_cosine_gate = _env_flag('TRANSFUSER_ACTIVATION_COSINE_GATE', True)
+    self.transfuser_activation_cosine_gate_low = float(
+        os.environ.get('TRANSFUSER_ACTIVATION_COSINE_GATE_LOW', '0.30'))
+    self.transfuser_activation_cosine_gate_high = float(
+        os.environ.get('TRANSFUSER_ACTIVATION_COSINE_GATE_HIGH', '0.55'))
+    self.transfuser_activation_cosine_gate_brake = _env_flag(
+        'TRANSFUSER_ACTIVATION_COSINE_GATE_BRAKE', False)
+    self.transfuser_activation_cosine_gate_verbose = _env_flag(
+        'TRANSFUSER_ACTIVATION_COSINE_GATE_VERBOSE', False)
+    if (self.transfuser_activation_cosine_gate and
+        self.transfuser_activation_cosine_gate_high <= self.transfuser_activation_cosine_gate_low):
+      raise ValueError(
+          'TRANSFUSER_ACTIVATION_COSINE_GATE_HIGH must be greater than '
+          'TRANSFUSER_ACTIVATION_COSINE_GATE_LOW.')
 
     if self.config.backbone == 'transFuser':
       self.backbone = TransfuserBackbone(config)
@@ -368,7 +390,20 @@ class LidarCenterNet(nn.Module):
             joined_checkpoint_features = self.join(self.checkpoint_query.repeat(bs, 1, 1), fused_features)
 
           features_to_save = joined_checkpoint_features
-          joined_checkpoint_features = self.activation_injector.apply(
+          if self.config.backbone == 'transFuser' and self.transfuser_activation_cosine_gate:
+            gated_actions = ('left', 'right')
+            if self.transfuser_activation_cosine_gate_brake:
+              gated_actions = ('brake',) + gated_actions
+            joined_checkpoint_features = self.activation_injector.apply_cosine_gated(
+                joined_checkpoint_features,
+                alpha=steering_alpha,
+                low=self.transfuser_activation_cosine_gate_low,
+                high=self.transfuser_activation_cosine_gate_high,
+                gated_actions=gated_actions,
+                verbose=self.transfuser_activation_cosine_gate_verbose,
+                log_prefix='TransFuser')
+          else:
+            joined_checkpoint_features = self.activation_injector.apply(
                 joined_checkpoint_features,
                 alpha=steering_alpha)
           gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]

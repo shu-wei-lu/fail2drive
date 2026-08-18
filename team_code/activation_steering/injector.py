@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 
 class ActivationInjector:
@@ -102,6 +103,98 @@ class ActivationInjector:
     if self.verbose:
       print(f"[ActivationInjector] apply layer={layer_index} alpha={alpha_value}")
     return features + float(alpha_vector[0]) * self.vector(features, layer_index, num_layers)
+
+  def apply_cosine_gated(
+      self,
+      features: torch.Tensor,
+      alpha: float | None = None,
+      low: float = 0.30,
+      high: float = 0.55,
+      gated_actions: tuple[str, ...] = ("left", "right"),
+      layer_index: int | None = None,
+      num_layers: int | None = None,
+      verbose: bool = False,
+      log_prefix: str = "ActivationInjector",
+  ) -> torch.Tensor:
+    """Apply steering vectors with an inverse cosine-similarity gate.
+
+    A feature already aligned with its steering vector receives less additional
+    steering. Similarities at or below ``low`` use the full alpha; similarities
+    at or above ``high`` use zero alpha. A legacy single vector is always gated
+    because its action identity is not available. For multi-action vectors,
+    ``gated_actions`` controls which of [brake, left, right] are gated.
+    """
+    if high <= low:
+      raise ValueError("Cosine gate high threshold must be greater than low threshold.")
+    if self.alpha_value(alpha) <= 0.0:
+      return features
+
+    alpha_vector = self.alpha_vector(alpha).to(device=features.device, dtype=features.dtype)
+    if self._has_action_vectors():
+      vectors = self.action_vectors(features, layer_index, num_layers)
+      alpha_scales = torch.as_tensor(
+          self.action_alpha_scales, device=features.device, dtype=features.dtype)
+      result = features
+      for action_index, (action_alpha, vector) in enumerate(zip(alpha_vector * alpha_scales, vectors)):
+        if vector is None or float(action_alpha.detach().cpu()) == 0.0:
+          continue
+        action = self.ACTIONS[action_index]
+        gate = 1.0
+        similarity = None
+        if action in gated_actions:
+          similarity, gate = self._cosine_gate(features, vector, low, high)
+        result = result + action_alpha * gate * vector
+        if verbose:
+          self._print_cosine_gate(log_prefix, action, similarity, gate, action_alpha)
+      return result
+
+    if self.vector_path is None:
+      if not self._warned_disabled:
+        print("[ActivationInjector] disabled: set ACTIVATION_VECTOR_PATH to enable activation steering", flush=True)
+        self._warned_disabled = True
+      return features
+
+    vector = self.vector(features, layer_index, num_layers)
+    similarity, gate = self._cosine_gate(features, vector, low, high)
+    if verbose:
+      self._print_cosine_gate(log_prefix, "single", similarity, gate, alpha_vector[0])
+    return features + alpha_vector[0] * gate * vector
+
+  @staticmethod
+  def _cosine_gate(
+      features: torch.Tensor,
+      vector: torch.Tensor,
+      low: float,
+      high: float,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    if vector.ndim != features.ndim:
+      raise ValueError(
+          f"Cosine gate requires matching ranks, got feature rank {features.ndim} "
+          f"and vector rank {vector.ndim}.")
+    if not all(vector_size in (1, feature_size)
+               for vector_size, feature_size in zip(vector.shape, features.shape)):
+      raise ValueError(
+          f"Cosine gate vector shape {tuple(vector.shape)} cannot be broadcast to "
+          f"feature shape {tuple(features.shape)}.")
+
+    reference_vector = vector.expand(*features.shape)
+    feature_flat = features.detach().float().reshape(features.shape[0], -1)
+    vector_flat = reference_vector.detach().float().reshape(reference_vector.shape[0], -1)
+    similarity = F.cosine_similarity(feature_flat, vector_flat, dim=1, eps=1e-8)
+    gate = ((high - similarity) / (high - low)).clamp(0.0, 1.0)
+    gate = gate.to(device=features.device, dtype=features.dtype)
+    gate = gate.reshape(features.shape[0], *([1] * (features.ndim - 1)))
+    return similarity, gate
+
+  @staticmethod
+  def _print_cosine_gate(log_prefix, action, similarity, gate, alpha):
+    similarity_text = "disabled" if similarity is None else similarity.detach().cpu().tolist()
+    gate_text = gate if isinstance(gate, float) else gate.detach().cpu().flatten().tolist()
+    print(
+        f"[{log_prefix} cosine gate] action={action}, similarity={similarity_text}, "
+        f"gate={gate_text}, alpha={float(alpha.detach().cpu()):.4f}",
+        flush=True,
+    )
 
   def _apply_action_vectors(
       self,

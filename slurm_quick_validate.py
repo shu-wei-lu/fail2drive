@@ -38,76 +38,76 @@ SBATCH_OPTIONS = {
 # independent Slurm job.  Keeping the full command in every entry makes it easy
 # to change agent/config/environment variables for just one test.
 TESTS = [
-    {
-        "name": "f2d_1030",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+#     {
+#         "name": "f2d_1020_hipad",
+#         "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+#   --agent ./team_code/hipad_f2d_agent.py \
+#   --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
+#   --routes ./fail2drive_split/Generalization_CustomObstacles_1020.xml \
+#   --port "$FREE_WORLD_PORT"''',
+#     },
+{
+        "name": "f2d_0002_transfuser",
+        "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
 python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Generalization_FullyBlocked_1030.xml \
+  --agent ./team_code/sensor_agent.py \
+  --agent-config ./checkpoints/tfpp \
+  --routes ./fail2drive_split/Base_BadParking_0002.xml \
   --port "$FREE_WORLD_PORT"''',
     },
     {
-        "name": "f2d_1031",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+        "name": "f2d_0004_transfuser",
+        "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
 python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Generalization_FullyBlocked_1031.xml \
+  --agent ./team_code/sensor_agent.py \
+  --agent-config ./checkpoints/tfpp \
+  --routes ./fail2drive_split/Base_BadParking_0004.xml \
   --port "$FREE_WORLD_PORT"''',
     },
+#     {
+#         "name": "f2d_0012_transfuser",
+#         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+#   --agent ./team_code/sensor_agent.py \
+#   --agent-config ./checkpoints/tfpp \
+#   --routes ./fail2drive_split/Base_ConstructionPedestrian_0012.xml \
+#   --port "$FREE_WORLD_PORT"''',
+#     },
+#     {
+#             "name": "f2d_0016_transfuser",
+#             "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+#     python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+#       --agent ./team_code/sensor_agent.py \
+#       --agent-config ./checkpoints/tfpp \
+#       --routes ./fail2drive_split/Base_ConstructionPermutations_0016.xml \
+#       --port "$FREE_WORLD_PORT"''',
+#         },
+#         {
+#                 "name": "f2d_0017_transfuser",
+#                 "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+#         python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+#           --agent ./team_code/sensor_agent.py \
+#           --agent-config ./checkpoints/tfpp \
+#           --routes ./fail2drive_split/Base_ConstructionPermutations_0017.xml \
+#           --port "$FREE_WORLD_PORT"''',
+#             },
+#     {
+#         "name": "f2d_0021_transfuser",
+#         "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+# python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
+#   --agent ./team_code/sensor_agent.py \
+#   --agent-config ./checkpoints/tfpp \
+#   --routes ./fail2drive_split/Base_CustomObstacles_0021.xml \
+#   --port "$FREE_WORLD_PORT"''',
+#     },
     {
-        "name": "f2d_1033",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
+        "name": "f2d_0056_transfuser",
+        "command": r''' LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
 python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Generalization_FullyBlocked_1033.xml \
-  --port "$FREE_WORLD_PORT"''',
-    },
-    {
-        "name": "f2d_1034",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Generalization_FullyBlocked_1034.xml \
-  --port "$FREE_WORLD_PORT"''',
-    },
-    {
-        "name": "f2d_0030",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Base_FullyBlocked_0030.xml \
-  --port "$FREE_WORLD_PORT"''',
-    },
-    {
-        "name": "f2d_0031",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Base_FullyBlocked_0031.xml \
-  --port "$FREE_WORLD_PORT"''',
-    },
-    {
-        "name": "f2d_0033",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Base_FullyBlocked_0033.xml \
-  --port "$FREE_WORLD_PORT"''',
-    },
-    {
-        "name": "f2d_0034",
-        "command": r'''LIVE_VISU=0 SAVE_PATH="$TEST_OUTPUT/viz_vehicle" DEBUG_CHALLENGE=1 \
-python -u leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --agent ./team_code/hipad_f2d_agent.py \
-  --agent-config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
-  --routes ./fail2drive_split/Base_FullyBlocked_0034.xml \
+  --agent ./team_code/sensor_agent.py \
+  --agent-config ./checkpoints/tfpp \
+  --routes ./fail2drive_split/Base_RightOfWay_0056.xml \
   --port "$FREE_WORLD_PORT"''',
     },
 ]
@@ -145,7 +145,7 @@ echo "Test: {name}"
 echo "Output: $TEST_OUTPUT"
 
 : "${{CARLA_ROOT:?CARLA_ROOT is not set. Submit from the activated fail2drive environment.}}"
-: "${{HIP:?HIP is not set. Export HIP before submitting.}}"
+# : "${{HIP:?HIP is not set. Export HIP before submitting.}}"
 
 free_port() {{
   local start=$1

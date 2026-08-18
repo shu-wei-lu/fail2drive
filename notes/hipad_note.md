@@ -9,6 +9,7 @@ export HIP=/mnt/bapve/thome/shuwei/HiP-AD
 export CARLA_ROOT=$F2D/f2d_carla
 export PYTHONPATH=$F2D/leaderboard:$F2D/scenario_runner:$CARLA_ROOT/PythonAPI:$CARLA_ROOT/PythonAPI/carla:$HIP:$PYTHONPATH
 export IS_BENCH2DRIVE=1
+export SCENARIO_RUNNER_ROOT="$F2D/scenario_runner"
 
 --agent_file $F2D/team_code/hipad_f2d_agent.py \
 --agent_config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d" \
@@ -102,3 +103,10 @@ python post_process_steering_features.py \
   --manual-negative-frames steering/hipad_new/Brake/negative_picked_frames.json
 
   python slurm_evaluate.py   --routes fail2drive_split   --out_root results/hipad_oracle_new_6   --seeds 1   --retries 2  --agent_file ./team_code/hipad_f2d_agent.py   --agent_config "$HIP/projects/configs/hipad_b2d_stage2.py+$HIP/ckpts/hipad_stage2.pth+hipad_f2d"
+
+  export ACTIVATION_VECTOR_PATHS="./steering/transfuser/post_process/brake/steering_vector.pt,./steering/transfuser/post_process/left/steering_vector.pt,./steering/transfuser/post_process/right/steering_vector.pt"
+
+  CUDA_VISIBLE_DEVICES=1 python ./tools/depth_ttc_server.py   --host 127.0.0.1   --port $DEPTH_PORT   --device cuda:0   --depth-anything-root $DEPTH_ROOT   --checkpoint $DEPTH_ROOT/metric_depth/checkpoints/depth_anything_v2_metric_vkitti_vitl.pth   --encoder vitl   --max-depth 80
+
+  python slurm_evaluate.py   --routes fail2drive_split   --out_root results/transfuser_oracle   --seeds 1   --retries 2  --agent_file ./team_code/sensor_agent.py \
+  --agent_config ./checkpoints/tfpp 

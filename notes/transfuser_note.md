@@ -17,3 +17,14 @@ export ACTIVATION_VECTOR_PATHS="./steering/transfuser/post_process/brake/steerin
 export BRAKE_ACTIVATION_ALPHA_SCALE=1.0
 export LEFT_ACTIVATION_ALPHA_SCALE=2.0
 export RIGHT_ACTIVATION_ALPHA_SCALE=1.0
+
+# Feature-only scalar-projection gate. The negative_mean.pt files are loaded
+# automatically from the directories containing the steering vectors.
+export ACTIVATION_PROJECTION_GATE=1
+export ACTIVATION_PROJECTION_GATE_LOW=0.05
+export ACTIVATION_PROJECTION_GATE_HIGH=0.10
+export ACTIVATION_PROJECTION_GATE_VERBOSE=0
+
+# Brake remains ungated by default because its current vector represents the
+# stopped/brake-hold state rather than active braking.
+export ACTIVATION_PROJECTION_GATE_BRAKE=0

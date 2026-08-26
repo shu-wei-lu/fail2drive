@@ -324,27 +324,6 @@ def submission_environment(
     return env
 
 
-def archive_existing_log(path: Path, previous_job_id: str | None) -> Path | None:
-    """Move a previous attempt's log out of the path monitored for fatal errors."""
-    if not path.exists():
-        return None
-
-    archive_dir = path.parent / "archive"
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%dT%H%M%S")
-    job_label = previous_job_id or "unknown"
-    archive_path = archive_dir / f"{path.name}.{timestamp}.job-{job_label}"
-    sequence = 1
-    while archive_path.exists():
-        archive_path = archive_dir / (
-            f"{path.name}.{timestamp}.job-{job_label}.{sequence}"
-        )
-        sequence += 1
-
-    path.replace(archive_path)
-    return archive_path
-
-
 def submit_job(
     template: Path,
     args: argparse.Namespace,
@@ -353,16 +332,18 @@ def submit_job(
     out_root: Path,
     extra_env: dict[str, str],
 ) -> str:
-    for path in (job.stdout_file, job.stderr_file):
+    # Every retry starts with fresh logs. Old failed-attempt logs are deliberately
+    # discarded so fatal-pattern monitoring only sees the current attempt.
+    for path in (
+        job.stdout_file,
+        job.stderr_file,
+        job.evaluator_stdout_file,
+        job.evaluator_stderr_file,
+    ):
         try:
             path.unlink()
         except FileNotFoundError:
             pass
-
-    for path in (job.evaluator_stdout_file, job.evaluator_stderr_file):
-        archived_path = archive_existing_log(path, job.job_id)
-        if archived_path is not None:
-            print(f"[archive] {path} -> {archived_path}", flush=True)
 
     env = submission_environment(
         os.environ, args, job, route_dir, out_root, extra_env

@@ -22,6 +22,11 @@ class PlannerAdapter(ABC):
     explicit = row.get("feature_path")
     if explicit:
       path = Path(explicit)
+      requested_model_dir = f"model_{model_index:02d}"
+      if path.parent.name.startswith("model_") and path.parent.name != requested_model_dir:
+        requested_path = path.parent.parent / requested_model_dir / path.name
+        if requested_path.exists():
+          return requested_path
       if path.exists():
         return path
 

@@ -64,7 +64,7 @@ export PDM_ORACLE_ROADBLOCKED_DISTANCE=40
 export PDM_ORACLE_PRIORITY_DISTANCE=25
 export PDM_ORACLE_YIELD_EMERGENCY_DISTANCE=50
 export PDM_ORACLE_GENERAL_BRAKE=1
-export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad_new/post_process/brake_align_q_v5/steering_vector.pt,$F2D/steering/hipad_new/post_process/left_change_lane_align_q/steering_vector.pt,$F2D/steering/hipad_new/post_process/right_align_q/steering_vector.pt"
+export ACTIVATION_VECTOR_PATHS="$F2D/steering/hipad_new/post_process/brake/steering_vector.pt,$F2D/steering/hipad_new/post_process/left/steering_vector.pt,$F2D/steering/hipad_new/post_process/right/steering_vector.pt"
 
 export BRAKE_ACTIVATION_ALPHA_SCALE=1.0
 export LEFT_ACTIVATION_ALPHA_SCALE=3.0
@@ -110,3 +110,5 @@ python post_process_steering_features.py \
 
   python slurm_evaluate.py   --routes fail2drive_split   --out_root results/transfuser_oracle   --seeds 1   --retries 2  --agent_file ./team_code/sensor_agent.py \
   --agent_config ./checkpoints/tfpp 
+  
+  transfuser left scale=2.0, right=brake=1.0
